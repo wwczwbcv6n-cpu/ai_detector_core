@@ -1,0 +1,15 @@
+torch
+torchvision
+diffusers
+transformers
+accelerate
+scipy
+moviepy
+ffmpeg-python
+Pillow
+opencv-python
+pyheif
+scikit-learn
+flask
+PyWavelets
+scikit-image

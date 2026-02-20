@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Build artifacts
+build/
+*.so
+*.o
+
+# Data directories (too large for version control)
+data/
+genimage_data/
+
+# Model files (large binary files)
+models/*.h5
+models/*.pth
+models/*.ts
+models/*.ptl
+models/*.json
+models/ai_detector_model_pytorch/
+
+# Temp training artifacts
+data/temp_frames/
+
+# LibTorch (downloaded dependency)
+libtorch*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Stray files at root
+~
+*.jpg
+*.png
+*.jpeg
+
+# Notebooks checkpoints
+notebooks/.ipynb_checkpoints/
