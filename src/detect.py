@@ -9,20 +9,78 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 
-# PRNU helpers
-from prnu import analyze_prnu
-from prnu_features import extract_prnu_features
+# Model definitions
+from model_prnu import DeepFusionNet, EfficientFusionNet, PRNUFusionNet
+from prnu import analyze_prnu, extract_noise_residual
+from prnu_features import extract_prnu_features_fullres
+from image_loader import UniversalImageLoader
+from prnu_recovery import build_prnu_recovery_net
 
 # --- Configuration ---
 IMG_WIDTH  = 512
 IMG_HEIGHT = 512
 
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR  = os.path.join(SCRIPT_DIR, '..', 'models')
+# Platform compression profiles — used to annotate results and scale PRNU
+# reliability when the caller provides a platform hint.
+# prnu_reliability: how much PRNU signal survives compression (1.0 = full, 0.0 = destroyed)
+PLATFORM_PROFILES = {
+    # ── Social / streaming platforms ────────────────────────────────────────
+    'youtube':   {'tier': 'high',    'codec': 'H.264/AV1',      'max_px': 4096,
+                  'quality_range': (85, 95),  'prnu_reliability': 1.00,
+                  'description': 'High bitrate, minimal compression'},
+    'vimeo':     {'tier': 'high',    'codec': 'H.264/VP9',      'max_px': 4096,
+                  'quality_range': (90, 98),  'prnu_reliability': 1.00,
+                  'description': 'Near-lossless, excellent quality'},
+    'tiktok':    {'tier': 'medium',  'codec': 'H.265',          'max_px': 1080,
+                  'quality_range': (70, 82),  'prnu_reliability': 0.80,
+                  'description': 'Decent quality, efficient H.265'},
+    'instagram': {'tier': 'medium',  'codec': 'H.264',          'max_px': 1080,
+                  'quality_range': (60, 75),  'prnu_reliability': 0.70,
+                  'description': 'Noticeably aggressive re-encode'},
+    'facebook':  {'tier': 'heavy',   'codec': 'H.264',          'max_px': 960,
+                  'quality_range': (55, 72),  'prnu_reliability': 0.55,
+                  'description': 'Heavy compression, double-encoded'},
+    'twitter':   {'tier': 'heavy',   'codec': 'H.264',          'max_px': 900,
+                  'quality_range': (50, 68),  'prnu_reliability': 0.50,
+                  'description': 'Among the worst quality platforms'},
+    'snapchat':  {'tier': 'extreme', 'codec': 'H.264',          'max_px': 720,
+                  'quality_range': (40, 60),  'prnu_reliability': 0.35,
+                  'description': 'Lowest quality, speed over fidelity'},
+    # ── Messaging ────────────────────────────────────────────────────────────
+    'telegram':  {'tier': 'medium',  'codec': 'MTProto/JPEG',   'max_px': 1280,
+                  'quality_range': (78, 85),  'prnu_reliability': 0.82,
+                  'description': 'Telegram photo send (MTProto protocol)'},
+    # ── Container / codec formats ────────────────────────────────────────────
+    'heic':      {'tier': 'high',    'codec': 'HEVC/HEIF',      'max_px': 4032,
+                  'quality_range': (85, 92),  'prnu_reliability': 0.92,
+                  'description': 'Apple HEIC/HEIF — efficient near-lossless format'},
+    'h264':      {'tier': 'medium',  'codec': 'H.264/AVC',      'max_px': 1920,
+                  'quality_range': (72, 88),  'prnu_reliability': 0.72,
+                  'description': 'Generic H.264/AVC encoded video frame'},
+    'h265':      {'tier': 'medium',  'codec': 'H.265/HEVC',     'max_px': 3840,
+                  'quality_range': (78, 90),  'prnu_reliability': 0.80,
+                  'description': 'Generic H.265/HEVC encoded video frame'},
+}
 
-# New dual-branch model path (preferred)
-NEW_MODEL_PATH = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion.pth')
-# Original single-branch fallback
+# Aliases accepted in the ?platform= query param
+_PLATFORM_ALIASES = {
+    'x':          'twitter',
+    'twitter/x':  'twitter',
+    'heif':       'heic',
+    'apple':      'heic',
+    'mtproto':    'telegram',
+    'avc':        'h264',
+    'h264/h265':  'h265',
+    'hevc':       'h265',
+}
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(SCRIPT_DIR, '..', 'models')
+
+# Model paths — try v6 first, then v5, then legacy
+V6_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion_v6.pth')
+V5_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion_v5.pth')
+V4_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion.pth')
 OLD_MODEL_PATH = os.path.join(MODELS_DIR, 'ai_detector_model_pytorch.pth')
 
 
@@ -41,14 +99,10 @@ def compute_gradcam(
     """
     Compute a Grad-CAM heatmap for the given inputs.
 
-    Registers forward + backward hooks on `target_layer`, runs one forward
-    pass and one backward pass on the positive class logit, then computes
-    the channel-weighted activation map.
-
     Args:
-        model        : PRNUFusionNet (or any model with spatial feature maps)
+        model        : DeepFusionNet (or any model with spatial feature maps)
         img_tensor   : (1, 3, H, W) — normalised image tensor, requires_grad
-        prnu_tensor  : (1, 8) or None — PRNU features (None for legacy model)
+        prnu_tensor  : (1, dim) or None — PRNU features (None for legacy model)
         target_layer : the Conv layer to hook
         orig_width   : width to resize the heatmap to
         orig_height  : height to resize the heatmap to
@@ -72,27 +126,25 @@ def compute_gradcam(
         model.zero_grad()
         img_tensor = img_tensor.requires_grad_(True)
 
-        # Forward
         if prnu_tensor is not None:
             logits = model(img_tensor, prnu_tensor)
         else:
             logits = model(img_tensor)
 
-        # Backward on positive class (AI)
+        # Handle tuple output (shouldn't happen in eval mode, but guard anyway)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+
         score = logits[0, 0]
         score.backward()
 
-        acts = activations['feat']          # (1, C, h, w)
-        grads = gradients['grad']           # (1, C, h, w)
+        acts  = activations['feat']     # (1, C, h, w)
+        grads = gradients['grad']       # (1, C, h, w)
 
-        # Global average pool the gradients → channel weights
-        weights = grads.mean(dim=[2, 3], keepdim=True)  # (1, C, 1, 1)
+        weights = grads.mean(dim=[2, 3], keepdim=True)   # (1, C, 1, 1)
+        cam     = (weights * acts).sum(dim=1, keepdim=True)   # (1, 1, h, w)
+        cam     = torch.relu(cam)
 
-        # Weighted sum of activation maps
-        cam = (weights * acts).sum(dim=1, keepdim=True)  # (1, 1, h, w)
-        cam = torch.relu(cam)
-
-        # Normalise to [0, 1]
         cam_np = cam.squeeze().detach().cpu().numpy()
         cam_min, cam_max = cam_np.min(), cam_np.max()
         if cam_max > cam_min:
@@ -100,7 +152,6 @@ def compute_gradcam(
         else:
             cam_np = np.zeros_like(cam_np)
 
-        # Resize to original image dimensions
         cam_pil = Image.fromarray((cam_np * 255).astype(np.uint8))
         cam_pil = cam_pil.resize((orig_width, orig_height), Image.BILINEAR)
         return np.array(cam_pil, dtype=np.float32) / 255.0
@@ -118,37 +169,20 @@ def heatmap_to_base64_png(
     """
     Overlay the heatmap (JET colormap) on the original image and return
     a base64-encoded PNG string.
-
-    Args:
-        heatmap           : (H, W) float32 in [0, 1]
-        orig_image_array  : (H, W, 3) uint8 RGB original image
-        alpha             : heatmap blend factor (0 = original only, 1 = heatmap only)
-
-    Returns:
-        str: base64-encoded PNG
     """
-    # Jet colormap: map [0,1] → RGB
     h_uint8 = (heatmap * 255).astype(np.uint8)
-    jet = _apply_jet_colormap(h_uint8)  # (H, W, 3) uint8
-
-    # Blend with original image
-    orig = orig_image_array.astype(np.float32)
-    blended = (1.0 - alpha) * orig + alpha * jet.astype(np.float32)
-    blended = np.clip(blended, 0, 255).astype(np.uint8)
-
+    jet     = _apply_jet_colormap(h_uint8)
+    orig    = orig_image_array.astype(np.float32)
+    blended = np.clip((1.0 - alpha) * orig + alpha * jet.astype(np.float32), 0, 255).astype(np.uint8)
     pil_img = Image.fromarray(blended)
-    buf = io.BytesIO()
+    buf     = io.BytesIO()
     pil_img.save(buf, format='PNG', optimize=True)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode('utf-8')
 
 
 def _apply_jet_colormap(gray_uint8: np.ndarray) -> np.ndarray:
-    """
-    Pure-numpy JET colormap.
-    Input:  (H, W) uint8 in [0, 255]
-    Output: (H, W, 3) uint8 RGB
-    """
+    """Pure-numpy JET colormap. Input: (H,W) uint8. Output: (H,W,3) uint8 RGB."""
     v = gray_uint8.astype(np.float32) / 255.0
     r = np.clip(1.5 - np.abs(4.0 * v - 3.0), 0.0, 1.0)
     g = np.clip(1.5 - np.abs(4.0 * v - 2.0), 0.0, 1.0)
@@ -157,7 +191,7 @@ def _apply_jet_colormap(gray_uint8: np.ndarray) -> np.ndarray:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Internal model definitions (kept local for backward compat)
+#  Internal model definitions (kept for backward compat)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _PyTorchCNN(nn.Module):
@@ -165,25 +199,17 @@ class _PyTorchCNN(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.ReLU(),
-            nn.MaxPool2d(2, 2),
+            nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
         )
         self.avgpool    = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64, 64), nn.ReLU(),
+            nn.Flatten(), nn.Linear(64, 64), nn.ReLU(),
             nn.Linear(64, num_classes), nn.Sigmoid(),
         )
-        # Expose last conv for Grad-CAM
-        self.last_conv  = self.features[-3]   # the third Conv2d
-
     def forward(self, x):
-        feat = self.features(x)
-        return self.classifier(self.avgpool(feat))
+        return self.classifier(self.avgpool(self.features(x)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -194,13 +220,20 @@ class Detector:
     """
     Main inference class.
 
-    Automatically loads the new PRNUFusionNet if available; falls back to
-    the legacy PyTorchCNN otherwise. Grad-CAM is supported for both.
+    Load order:
+      1. ai_detector_prnu_fusion_v6.pth → DeepFusionNet v6 (12-branch, 32-dim PRNU)
+      2. ai_detector_prnu_fusion_v5.pth → DeepFusionNet v5 (8-branch,  32-dim PRNU)
+      3. ai_detector_prnu_fusion.pth    → DeepFusionNet v5 (if new arch keys)
+                                        → falls through if old v4 keys
+      4. ai_detector_model_pytorch.pth  → legacy PyTorchCNN fallback
     """
 
     def __init__(self):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.use_fusion = False
+        self.device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_fusion  = False
+        self.prnu_dim    = 64
+        self._model_type = 'unknown'
+        self._image_loader = UniversalImageLoader()
 
         self.transform = transforms.Compose([
             transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
@@ -209,26 +242,33 @@ class Detector:
                                  std=[0.229, 0.224, 0.225]),
         ])
 
-        # --- Try to load the new PRNUFusionNet first ---
-        if os.path.exists(NEW_MODEL_PATH):
-            try:
-                from model_prnu import PRNUFusionNet
-                self.model = PRNUFusionNet().to(self.device)
-                state = torch.load(NEW_MODEL_PATH, map_location=self.device)
-                self.model.load_state_dict(state)
-                self.model.eval()
-                self.use_fusion = True
-                print(f"✓ Loaded PRNUFusionNet from {NEW_MODEL_PATH}")
-            except Exception as e:
-                print(f"⚠ Could not load PRNUFusionNet ({e}), falling back to legacy model.")
-                self.use_fusion = False
+        # --- Load PRNU recovery net ---
+        try:
+            self.recovery_net = build_prnu_recovery_net(device=self.device)
+        except Exception as e:
+            print(f"  PRNU recovery net unavailable: {e}")
+            self.recovery_net = None
+
+        # --- Try DeepFusionNet v6/v5 ---
+        for model_path in (V6_MODEL_PATH, V5_MODEL_PATH, V4_MODEL_PATH):
+            if not os.path.exists(model_path):
+                continue
+            loaded, prnu_dim, model_type = self._try_load_fusion(model_path)
+            if loaded is not None:
+                self.model       = loaded
+                self.prnu_dim    = prnu_dim
+                self._model_type = model_type
+                self.use_fusion  = True
+                print(f"  Loaded {model_type} from {model_path}")
+                break
 
         # --- Fallback to legacy model ---
         if not self.use_fusion:
             if not os.path.exists(OLD_MODEL_PATH):
                 raise FileNotFoundError(
                     f"No model file found.\n"
-                    f"  Tried: {NEW_MODEL_PATH}\n"
+                    f"  Tried: {V5_MODEL_PATH}\n"
+                    f"  Tried: {V4_MODEL_PATH}\n"
                     f"  Tried: {OLD_MODEL_PATH}\n"
                     f"Please train the model first."
                 )
@@ -236,77 +276,126 @@ class Detector:
             state = torch.load(OLD_MODEL_PATH, map_location=self.device)
             self.model.load_state_dict(state)
             self.model.eval()
-            print(f"✓ Loaded legacy PyTorchCNN from {OLD_MODEL_PATH}")
+            self._model_type = 'PyTorchCNN (legacy)'
+            print(f"  Loaded legacy PyTorchCNN from {OLD_MODEL_PATH}")
 
-        # --- Identify Grad-CAM target layer ---
+        # --- Grad-CAM target layer ---
         if self.use_fusion:
             self.gradcam_layer = self.model.gradcam_target_layer
         else:
-            self.gradcam_layer = self.model.last_conv
+            self.gradcam_layer = self.model.features[-3]
 
     # ------------------------------------------------------------------
 
-    def predict(self, image_data: bytes, compute_heatmap: bool = True) -> dict:
+    def predict(self, image_data: bytes, compute_heatmap: bool = True,
+                platform: str = None) -> dict:
         """
         Analyse raw image bytes.
 
         Args:
-            image_data      : raw file bytes (JPEG, PNG, HEIC, …)
+            image_data      : raw file bytes (JPEG, PNG, HEIC, RAW, …)
             compute_heatmap : if True, run Grad-CAM and include heatmap_base64
+            platform        : optional source platform hint — one of
+                              'youtube', 'vimeo', 'tiktok', 'instagram',
+                              'facebook', 'twitter', 'snapchat'
+                              Adds platform_compression info to the result and
+                              scales PRNU reliability score accordingly.
 
         Returns:
             dict with keys:
-                ai_probability   — float [0, 1]
-                conclusion       — "AI-Generated" | "REAL"
-                prnu_analysis    — dict of raw PRNU metrics
-                heatmap_base64   — base64 PNG string (if compute_heatmap)
-                heatmap_width    — int
-                heatmap_height   — int
-                model_type       — "PRNUFusionNet" | "PyTorchCNN"
+                ai_probability, conclusion, prnu_analysis, model_type,
+                platform_compression (if platform given),
+                heatmap_base64 (optional), heatmap_width, heatmap_height
         """
-        # --- Load image ---
         try:
-            img = self._load_image(image_data)
+            img = self._image_loader.load(image_data)
         except Exception as e:
             return {"error": f"Could not load image: {e}"}
 
         orig_w, orig_h = img.size
-        orig_array = np.array(img.resize((min(orig_w, 1024), min(orig_h, 1024)),
-                                         Image.BILINEAR))
+        orig_array = np.array(
+            img.resize((min(orig_w, 1024), min(orig_h, 1024)), Image.BILINEAR)
+        )
 
-        # --- Preprocess ---
         img_tensor = self.transform(img).unsqueeze(0).to(self.device)
 
-        # --- PRNU features (always computed, even for legacy model) ---
-        _prnu_size = 128
-        prnu_raw = np.array(img.resize((_prnu_size, _prnu_size), Image.BILINEAR))
-        prnu_feats_np = extract_prnu_features(prnu_raw.astype(np.float64) / 255.0)
+        # --- PRNU features (32-dim with optional recovery net) ---
+        prnu_feats_np = extract_prnu_features_fullres(
+            img,
+            recovery_net=self.recovery_net,
+            device=self.device,
+        )
+        # Truncate/pad to expected dim (handles v4 vs v5 gracefully)
+        if len(prnu_feats_np) != self.prnu_dim:
+            tmp = np.zeros(self.prnu_dim, dtype=np.float32)
+            n   = min(len(prnu_feats_np), self.prnu_dim)
+            tmp[:n] = prnu_feats_np[:n]
+            prnu_feats_np = tmp
+
         prnu_tensor = torch.from_numpy(prnu_feats_np).unsqueeze(0).float().to(self.device)
+
+        # --- PRNU spatial noise map (B, 3, 128, 128) for PRNUSpatialBranch ---
+        prnu_map_tensor = None
+        if self.use_fusion:
+            try:
+                noise_img = img.resize((128, 128), Image.BILINEAR)
+                noise_arr = np.array(noise_img).astype(np.float64) / 255.0
+                noise_map = extract_noise_residual(noise_arr)          # (128, 128, 3)
+                noise_map = np.clip(noise_map, -1.0, 1.0).astype(np.float32)
+                noise_map = noise_map.transpose(2, 0, 1)               # (3, 128, 128)
+                prnu_map_tensor = torch.from_numpy(noise_map).unsqueeze(0).to(self.device)
+            except Exception as e:
+                print(f"  PRNU spatial map extraction failed: {e}")
 
         # --- Inference ---
         with torch.no_grad():
             if self.use_fusion:
-                logits = self.model(img_tensor, prnu_tensor)
+                out    = self.model(img_tensor, prnu_tensor, prnu_map_tensor)
+                logits = out[0] if isinstance(out, tuple) else out
                 ai_prob = float(torch.sigmoid(logits).item())
             else:
-                # Legacy model outputs sigmoid directly
-                ai_prob_cnn = float(self.model(img_tensor).item())
-                # Post-process PRNU blend (old behaviour preserved)
-                prnu_result_full = analyze_prnu(image_data)
-                prnu_ai_score = 1.0 - prnu_result_full.get("prnu_likelihood_real", 0.5)
+                ai_prob_cnn  = float(self.model(img_tensor).item())
+                prnu_result  = analyze_prnu(image_data)
+                prnu_ai_score = 1.0 - prnu_result.get("prnu_likelihood_real", 0.5)
                 ai_prob = 0.7 * ai_prob_cnn + 0.3 * prnu_ai_score
 
-        # --- PRNU detailed analysis (for the response dict) ---
+        # --- PRNU detailed analysis ---
         try:
             prnu_analysis = analyze_prnu(image_data)
         except Exception:
             prnu_analysis = {}
 
+        # --- Platform compression annotation ---
+        platform_info = None
+        if platform:
+            key     = platform.lower()
+            key     = _PLATFORM_ALIASES.get(key, key)
+            profile = PLATFORM_PROFILES.get(key)
+            if profile:
+                platform_info = {
+                    "platform":         key,
+                    "tier":             profile['tier'],
+                    "codec":            profile['codec'],
+                    "quality_range":    profile['quality_range'],
+                    "max_resolution":   profile['max_px'],
+                    "prnu_reliability": profile['prnu_reliability'],
+                    "description":      profile['description'],
+                    "note": (
+                        "PRNU signal heavily degraded by platform compression — "
+                        "visual branch results are more reliable."
+                        if profile['prnu_reliability'] < 0.6 else
+                        "Moderate compression — PRNU signal partially preserved."
+                        if profile['prnu_reliability'] < 0.85 else
+                        "Light compression — PRNU signal well preserved."
+                    ),
+                }
+
         result = {
-            "ai_probability": round(ai_prob, 4),
-            "conclusion":     "AI-Generated" if ai_prob > 0.5 else "REAL",
-            "prnu_analysis":  prnu_analysis,
-            "model_type":     "PRNUFusionNet" if self.use_fusion else "PyTorchCNN",
+            "ai_probability":      round(ai_prob, 4),
+            "conclusion":          "AI-Generated" if ai_prob > 0.5 else "REAL",
+            "prnu_analysis":       prnu_analysis,
+            "model_type":          self._model_type,
+            "platform_compression": platform_info,
         }
 
         # --- Grad-CAM heatmap ---
@@ -320,12 +409,11 @@ class Detector:
                     orig_width   = orig_array.shape[1],
                     orig_height  = orig_array.shape[0],
                 )
-                heatmap_b64 = heatmap_to_base64_png(heatmap, orig_array)
-                result["heatmap_base64"] = heatmap_b64
+                result["heatmap_base64"] = heatmap_to_base64_png(heatmap, orig_array)
                 result["heatmap_width"]  = orig_array.shape[1]
                 result["heatmap_height"] = orig_array.shape[0]
             except Exception as e:
-                print(f"⚠ Grad-CAM failed: {e}")
+                print(f"  Grad-CAM failed: {e}")
                 result["heatmap_base64"] = None
                 result["heatmap_width"]  = orig_w
                 result["heatmap_height"] = orig_h
@@ -336,22 +424,71 @@ class Detector:
     #  Internal helpers
     # ------------------------------------------------------------------
 
-    def _load_image(self, image_data: bytes) -> Image.Image:
-        """Load image bytes, with HEIC support."""
+    def _try_load_fusion(self, path: str):
+        """
+        Attempt to load a fusion model from `path`.
+
+        Peeks at the state dict to determine version:
+          - v6 has 'gan_diff_branch.spec_conv.0.weight'
+          - v5 has 'prnu_branch_v2.mlp.0.weight'  (no gan_diff_branch)
+          - v4 has 'prnu_branch.mlp.0.weight' with shape (128, 16)
+
+        Returns (model, prnu_dim, model_type) or (None, None, None).
+        """
         try:
-            return Image.open(io.BytesIO(image_data)).convert("RGB")
+            state = torch.load(path, map_location=self.device, weights_only=True)
         except Exception:
-            pass
-        # HEIC fallback
-        try:
-            import pyheif
-            heif_file = pyheif.read(image_data)
-            return Image.frombytes(
-                heif_file.mode, heif_file.size, heif_file.data,
-                "raw", heif_file.mode, heif_file.stride,
-            ).convert("RGB")
-        except Exception as e:
-            raise RuntimeError(f"Could not decode image: {e}")
+            try:
+                state = torch.load(path, map_location=self.device)
+            except Exception as e:
+                print(f"  Could not load state dict from {path}: {e}")
+                return None, None, None
+
+        # ── Detect architecture version ──────────────────────────────────
+        if 'gan_diff_branch.spec_conv.0.weight' in state:
+            # v6 architecture: 12 branches
+            try:
+                model = DeepFusionNet(prnu_in_features=64).to(self.device)
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                if unexpected:
+                    print(f"  v6 load: {len(unexpected)} unexpected keys (ignored)")
+                model.eval()
+                return model, 64, 'DeepFusionNet v6'
+            except Exception as e:
+                print(f"  Failed to load v6 model from {path}: {e}")
+                return None, None, None
+
+        elif 'prnu_branch_v2.mlp.0.weight' in state:
+            # v5 architecture: 8 branches — load into v6 with strict=False
+            # (new v6 branches will be randomly initialised)
+            try:
+                model = DeepFusionNet(prnu_in_features=64).to(self.device)
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                if missing:
+                    print(f"  v5→v6 upgrade: {len(missing)} new-branch weights "
+                          "initialised randomly")
+                model.eval()
+                return model, 64, 'DeepFusionNet v5→v6 (new branches randomly init)'
+            except Exception as e:
+                print(f"  Failed to upgrade v5 model from {path}: {e}")
+                return None, None, None
+
+        elif 'prnu_branch.mlp.0.weight' in state:
+            # Old v4 architecture — incompatible
+            print(f"  {path}: detected v4 checkpoint (16-dim PRNU) — "
+                  "incompatible with v6 architecture, skipping")
+            return None, None, None
+
+        else:
+            # Unknown — try v6 anyway
+            try:
+                model = DeepFusionNet(prnu_in_features=64).to(self.device)
+                model.load_state_dict(state, strict=False)
+                model.eval()
+                return model, 64, 'DeepFusionNet v6 (unknown checkpoint)'
+            except Exception as e:
+                print(f"  Failed to load unknown-version model from {path}: {e}")
+                return None, None, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -383,8 +520,7 @@ def main():
         print(f"  AI Probability : {result['ai_probability'] * 100:.2f}%")
         print(f"  Conclusion     : {result['conclusion']}")
         if result.get('heatmap_base64'):
-            hm_len = len(result['heatmap_base64'])
-            print(f"  Heatmap        : {hm_len} bytes (base64 PNG)")
+            print(f"  Heatmap        : {len(result['heatmap_base64'])} bytes (base64 PNG)")
         print(f"  PRNU Analysis  : {result.get('prnu_analysis', {})}")
 
     except FileNotFoundError as e:

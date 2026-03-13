@@ -1,0 +1,5 @@
+running build_ext
+building 'fast_video_processor' extension
+g++ -fno-strict-overflow -Wsign-compare -DDYNAMIC_ANNOTATIONS_ENABLED=1 -DNDEBUG -fexceptions -fcf-protection -fexceptions -fcf-protection -fexceptions -fcf-protection -O3 -fPIC -I/home/jamoliddinbekyodgorov/Desktop/ai_detector_core/venv/lib64/python3.14/site-packages/pybind11/include -I/usr/include/opencv4 -I/home/jamoliddinbekyodgorov/Desktop/ai_detector_core/venv/include -I/usr/include/python3.14 -c src/fast_video_processor.cpp -o build/temp.linux-x86_64-cpython-314/src/fast_video_processor.o -O3 -Wall -shared -std=c++14 -fPIC -fvisibility=hidden
+g++ -fno-strict-overflow -Wsign-compare -DDYNAMIC_ANNOTATIONS_ENABLED=1 -DNDEBUG -fexceptions -fcf-protection -fexceptions -fcf-protection -fexceptions -fcf-protection -O3 -shared build/temp.linux-x86_64-cpython-314/src/fast_video_processor.o -L/usr/lib64 -L/usr/lib64 -lopencv_core -lopencv_imgproc -lopencv_video -o build/lib.linux-x86_64-cpython-314/fast_video_processor.cpython-314-x86_64-linux-gnu.so -Wl,-Bsymbolic
+copying build/lib.linux-x86_64-cpython-314/fast_video_processor.cpython-314-x86_64-linux-gnu.so -> 

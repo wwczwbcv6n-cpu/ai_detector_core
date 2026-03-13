@@ -775,6 +775,11 @@ def train_from_source(
             pth_path = os.path.join(MODELS_DIR, 'ai_detector_model_pytorch.pth')
             torch.save(model.state_dict(), pth_path)
             print(f"\n  💾 Model saved: {pth_path}")
+            fusion_path = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion.pth')
+            if os.path.exists(fusion_path):
+                print(f"  ⚠️  NOTE: The main server loads 'ai_detector_prnu_fusion.pth' (EfficientFusionNet) first.")
+                print(f"      This legacy model will only be used if that fusion model is removed.")
+                print(f"      To deploy this model, remove {fusion_path} or retrain with train_pytorch.py.")
 
             try:
                 ts_path = os.path.join(MODELS_DIR, 'ai_detector_model_pytorch_script.ts')

@@ -1,0 +1,6 @@
+Looking in indexes: https://download.pytorch.org/whl/cu121
+ERROR: Could not find a version that satisfies the requirement torch (from versions: none)
+
+[notice] A new release of pip is available: 26.0 -> 26.0.1
+[notice] To update, run: pip install --upgrade pip
+ERROR: No matching distribution found for torch
