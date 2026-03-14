@@ -1,10 +1,10 @@
 """
-model_prnu.py — AI-Detector Model Library v6
+model_prnu.py — AI-Detector Model Library v6.1
 
 Major enhancements over v5:
 
-  DeepFusionNet  (image detection) — v6
-  ──────────────────────────────────────
+  DeepFusionNet  (image detection) — v6.1
+  ─────────────────────────────────────────
   Twelve-branch architecture:
     1.  EfficientNet-B3 vision backbone         (1536-dim)  [60% frozen]
     2.  SRMBranch  — 5 fixed forensic filters   (64-dim)
@@ -13,19 +13,21 @@ Major enhancements over v5:
     5.  PRNUBranchV2 — 64-dim PRNU + LayerNorm   (96-dim)
     6.  SpatialCNNBranch — spatial texture CNN   (128-dim)
     7.  HallucinationBranch — MobileNetV3-Small  (128-dim)
-    8.  PRNUSpatialBranch — 64×64 PRNU map CNN   (128-dim)
-    9.  GANDiffusionFingerprintBranch            (128-dim)  ← NEW
-    10. CMOSCCDSensorBranch                      (96-dim)   ← NEW
-    11. ColorChannelInconsistencyBranch          (96-dim)   ← NEW
-    12. OpticalFlowIrregularityBranch            (96-dim)   ← NEW
-  CrossAttentionFusion(d_model=192, n_heads=4, n_layers=2) → 768-dim
+    8.  PRNUSpatialBranch — 128×128 PRNU map CNN (128-dim)
+    9.  GANDiffusionFingerprintBranch            (128-dim)  ← NEW v6
+    10. CMOSCCDSensorBranch                      (96-dim)   ← NEW v6
+    11. ColorChannelInconsistencyBranch          (96-dim)   ← NEW v6
+    12. OpticalFlowIrregularityBranch            (96-dim)   ← NEW v6
+  BranchGate (SE-style per-branch importance weighting)     ← NEW v6.1
+  CrossAttentionFusion(d_model=192, n_heads=4, n_layers=3,
+                       pre-norm, learnable pos_emb) → 768-dim ← NEW v6.1
   Classifier: 768→384→64→1
   Aux heads (training only): per branch.
 
   Training: forward(img, prnu_feats, prnu_map) returns
             (logit, *aux_logits) in train mode, just logit in eval mode.
 
-  VRAM estimate at batch=4, 512×512, AMP FP16: ~3.4 GB
+  VRAM estimate at batch=4, 512×512, AMP FP16: ~3.4 GB (+1.5 MB for v6.1 additions)
 
   VideoTemporalFusionNet  (video / 4K detection)  — v4 (unchanged)
 
@@ -34,10 +36,12 @@ Major enhancements over v5:
     PRNUFusionNet      = DeepFusionNet
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from torchvision.models import (
     efficientnet_b3, EfficientNet_B3_Weights,
     mobilenet_v3_small, MobileNet_V3_Small_Weights,
@@ -739,8 +743,12 @@ class CrossAttentionFusion(nn.Module):
             dropout=0.1,
             activation='gelu',
             batch_first=True,
+            norm_first=True,   # pre-norm: more stable gradients
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.pos_emb = nn.Parameter(
+            torch.zeros(1, len(branch_dims), d_model)
+        )
         self.head = nn.Sequential(
             nn.Linear(d_model * len(branch_dims), out_dim),
             nn.SiLU(),
@@ -751,8 +759,40 @@ class CrossAttentionFusion(nn.Module):
         tokens   = torch.stack(
             [proj(b) for proj, b in zip(self.projs, branch_outputs)], dim=1
         )                                         # (B, N_branches, d_model)
+        tokens   = tokens + self.pos_emb          # broadcast over batch
         attended = self.transformer(tokens)       # (B, N_branches, d_model)
         return self.head(attended.flatten(1))     # (B, out_dim)
+
+
+# ---------------------------------------------------------------------------
+#  BranchGate — SE-style learnable per-branch importance weighting (v6.1)
+# ---------------------------------------------------------------------------
+
+class BranchGate(nn.Module):
+    """
+    Squeeze-and-Excitation style per-branch importance gating.
+
+    Reads a global context (concatenation of all branch outputs) and
+    produces one scalar weight per branch in (0, 1).  Branches that
+    are irrelevant for a given image are suppressed without being
+    zeroed out entirely (sigmoid, not hard mask).
+
+    Parameters chosen so the gate is cheap:
+      reduction=16  →  Linear(2688→168) + Linear(168→12)  ≈ 455 K params
+    """
+    def __init__(self, branch_dims: list, reduction: int = 16):
+        super().__init__()
+        total  = sum(branch_dims)
+        hidden = max(len(branch_dims) * 4, total // reduction)
+        self.fc = nn.Sequential(
+            nn.Linear(total, hidden), nn.SiLU(),
+            nn.Linear(hidden, len(branch_dims)), nn.Sigmoid(),
+        )
+
+    def forward(self, branch_outputs: list) -> list:
+        ctx = torch.cat(branch_outputs, dim=-1)   # (B, sum_dims)
+        w   = self.fc(ctx)                         # (B, n_branches)
+        return [b * w[:, i:i+1] for i, b in enumerate(branch_outputs)]
 
 
 # ---------------------------------------------------------------------------
@@ -797,8 +837,10 @@ class DeepFusionNet(nn.Module):
 
     _FREEZE_RATIO = 0.60
 
-    def __init__(self, dropout: float = 0.4, prnu_in_features: int = 64):
+    def __init__(self, dropout: float = 0.4, prnu_in_features: int = 64,
+                 gradient_checkpointing: bool = False):
         super().__init__()
+        self.use_ckpt = gradient_checkpointing
 
         # ── Vision backbone ──────────────────────────────────────────────
         net = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
@@ -842,8 +884,9 @@ class DeepFusionNet(nn.Module):
             96,     # Color Channel Inconsistency← NEW
             96,     # Optical Flow Irregularity  ← NEW
         ]   # 12 branches → total tokens = 12
+        self.branch_gate = BranchGate(branch_dims)   # v6.1: SE-style branch weighting
         self.fusion = CrossAttentionFusion(
-            branch_dims, out_dim=768, d_model=192, n_heads=4, n_layers=2
+            branch_dims, out_dim=768, d_model=192, n_heads=4, n_layers=3
         )
 
         # ── Classifier head ──────────────────────────────────────────────
@@ -872,13 +915,21 @@ class DeepFusionNet(nn.Module):
         """
         Args:
             img        : (B, 3, H, W) ImageNet-normalised
-            prnu_feats : (B, 32) scalar PRNU feature vector
-            prnu_map   : (B, 3, 64, 64) spatial PRNU noise map, or None
+            prnu_feats : (B, 64) scalar PRNU feature vector
+            prnu_map   : (B, 3, 128, 128) spatial PRNU noise map, or None
         """
         B = img.size(0)
 
+        # ── Backbone — gradient checkpointing saves ~300–600 MB during training
+        if self.use_ckpt and self.training:
+            cnn_out = grad_checkpoint(
+                lambda x: self.pool(self.backbone(x)).view(x.size(0), -1),
+                img, use_reentrant=False,
+            )
+        else:
+            cnn_out = self.pool(self.backbone(img)).view(B, -1)          # (B,1536)
+
         # ── v5 branches ──
-        cnn_out           = self.pool(self.backbone(img)).view(B, -1)   # (B,1536)
         srm_out           = self.srm_branch(img)                         # (B,64)
         freq_out          = self.freq_branch(img)                        # (B,128)
         color_out         = self.color_branch(img)                       # (B,64)
@@ -886,7 +937,7 @@ class DeepFusionNet(nn.Module):
         spatial_out       = self.spatial_branch(img)                     # (B,128)
         halluc_out        = self.halluc_branch(img)                      # (B,128)
         if prnu_map is None:
-            prnu_map = torch.zeros(B, 3, 64, 64, device=img.device, dtype=img.dtype)
+            prnu_map = torch.zeros(B, 3, 128, 128, device=img.device, dtype=img.dtype)
         prnu_spatial_out  = self.prnu_spatial_branch(prnu_map)           # (B,128)
 
         # ── v6 branches ──
@@ -895,11 +946,14 @@ class DeepFusionNet(nn.Module):
         color_incon_out   = self.color_incon_branch(img)                 # (B,96)
         flow_out          = self.flow_branch(img)                        # (B,96)
 
-        fused = self.fusion([
+        # ── v6.1: SE-style branch gating before fusion ──
+        branch_list = [
             cnn_out, srm_out, freq_out, color_out,
             prnu_out, spatial_out, halluc_out, prnu_spatial_out,
             gan_diff_out, cmos_out, color_incon_out, flow_out,
-        ])
+        ]
+        branch_list = self.branch_gate(branch_list)
+        fused = self.fusion(branch_list)
         logit = self.classifier(fused)                                   # (B,1)
 
         if self.training:
@@ -928,9 +982,9 @@ class DeepFusionNet(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen    = total - trainable
         print(
-            "  DeepFusionNet v6  (B3 + SRM + FFT×3 + YCbCr + PRNU-32 + SpatialCNN + "
+            "  DeepFusionNet v6.1  (B3 + SRM×15 + FFT×3 + YCbCr + PRNU-64 + SpatialCNN + "
             "MobileNetV3 + PRNUSpatialMap + GAN/Diff + CMOS/CCD + "
-            "ColorIncon + OpticalFlow + CrossAttn-192)"
+            "ColorIncon + OpticalFlow + BranchGate + CrossAttn-192×3 + INT8-ready)"
         )
         print(f"  Total parameters    : {total:,}")
         print(f"  Trainable           : {trainable:,}  ({trainable/total*100:.1f}%)")
@@ -956,6 +1010,23 @@ EfficientFusionNet = DeepFusionNet
 PRNUFusionNet      = DeepFusionNet
 
 
+def quantize_model_for_inference(model: 'DeepFusionNet') -> nn.Module:
+    """
+    Apply post-training dynamic INT8 quantization to all nn.Linear layers.
+
+    - Reduces model size ~2–3× on disk
+    - Speeds up CPU inference ~1.5–2.5×
+    - Zero retraining required
+    - GPU inference: no speedup (INT8 linear runs on CPU only)
+
+    Usage:
+        detector.model = quantize_model_for_inference(detector.model)
+    """
+    import torch.ao.quantization as tq
+    model.eval()
+    return tq.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+
+
 # ---------------------------------------------------------------------------
 #  Video sub-modules (v4 — unchanged)
 # ---------------------------------------------------------------------------
@@ -972,23 +1043,24 @@ class PRNUBranch(nn.Module):
 
 
 class PRNUDeepBranch(nn.Module):
-    def __init__(self, in_features: int = 16, out_features: int = 64):
+    """MLP for 64-dim per-frame PRNU features → out_features-dim."""
+    def __init__(self, in_features: int = 64, out_features: int = 64):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(in_features, 64), nn.SiLU(), nn.Dropout(0.2),
-            nn.Linear(64, 128),         nn.SiLU(), nn.Dropout(0.2),
+            nn.Linear(in_features, 128), nn.SiLU(), nn.Dropout(0.2),
+            nn.Linear(128, 128),         nn.SiLU(), nn.Dropout(0.2),
             nn.Linear(128, out_features), nn.SiLU(),
         )
     def forward(self, x): return self.mlp(x)
 
 
 class PRNUTemporalBranch(nn.Module):
-    """MLP for 16-dim inter-frame PRNU drift vector → 32-dim."""
-    def __init__(self, in_features: int = 16, out_features: int = 32):
+    """MLP for 64-dim inter-frame PRNU drift vector → out_features-dim."""
+    def __init__(self, in_features: int = 64, out_features: int = 32):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(in_features, 64), nn.SiLU(), nn.Dropout(0.2),
-            nn.Linear(64, out_features), nn.SiLU(),
+            nn.Linear(in_features, 128), nn.SiLU(), nn.Dropout(0.2),
+            nn.Linear(128, out_features), nn.SiLU(),
         )
     def forward(self, x): return self.mlp(x)
 
@@ -1096,8 +1168,8 @@ class VideoTemporalFusionNet(nn.Module):
     Branches:
       1. EfficientNet-B3 vision backbone                     → 1536-dim
       2. TemporalFlowBranch (6-ch pre-computed flow map)     → 64-dim
-      3. PRNUDeepBranch (per-frame PRNU 16-dim)              → 64-dim
-      4. PRNUTemporalBranch (inter-frame PRNU Δ)             → 32-dim
+      3. PRNUDeepBranch (per-frame PRNU 64-dim)              → 64-dim
+      4. PRNUTemporalBranch (inter-frame PRNU Δ 64-dim)     → 32-dim
       5. MotionTemporalBranch (real optical flow, GRU)       → 128-dim  ← NEW v5
       6. AudioBranch (optional mel-spectrogram)              → 64-dim
 
@@ -1137,8 +1209,8 @@ class VideoTemporalFusionNet(nn.Module):
         self._last_block = children[-1]
 
         self.temporal_branch      = TemporalFlowBranch(in_channels=6, out_features=self._FLOW_DIM)
-        self.prnu_branch          = PRNUDeepBranch(in_features=16, out_features=self._PRNU_DIM)
-        self.prnu_temporal_branch = PRNUTemporalBranch(in_features=16, out_features=self._PRNU_TEMP_DIM)
+        self.prnu_branch          = PRNUDeepBranch(in_features=64, out_features=self._PRNU_DIM)
+        self.prnu_temporal_branch = PRNUTemporalBranch(in_features=64, out_features=self._PRNU_TEMP_DIM)
         self.motion_branch        = MotionTemporalBranch(motion_dim=48, out_features=self._MOTION_DIM)
         if use_audio:
             self.audio_branch = AudioBranch(out_features=self._AUDIO_DIM)
@@ -1164,8 +1236,8 @@ class VideoTemporalFusionNet(nn.Module):
         Args:
             img          : (B, 3, H, W)   ImageNet-normalised
             flow         : (B, 6, H, W)   pre-computed 6-channel flow map
-            prnu_feats   : (B, 16)         per-frame PRNU features
-            prnu_delta   : (B, 16)         inter-frame PRNU delta
+            prnu_feats   : (B, 64)         per-frame PRNU features
+            prnu_delta   : (B, 64)         inter-frame PRNU delta
             motion_feats : (B, T, 48) or (B, 48) — from MotionAnalyzer, or None
             audio        : (B, 1, F, T_mel) mel-spectrogram, or None
 
@@ -1215,6 +1287,258 @@ class VideoTemporalFusionNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+#  UnifiedFusionNet v1 — single model for both image and video detection
+# ---------------------------------------------------------------------------
+
+class UnifiedFusionNet(nn.Module):
+    """
+    Unified image + video AI-detector — v1.
+
+    Shares one EfficientNet-B3 backbone, one BranchGate, one CrossAttentionFusion.
+    Image branches are always computed; video branches are zeroed in image mode.
+
+    Image mode  (default, mode="image"):
+        forward(img, prnu_feats, prnu_map)
+        Train → (logit, *8_aux_logits)   Eval → logit
+
+    Video mode  (mode="video"):
+        forward(img, prnu_feats, prnu_map, flow, prnu_delta, motion_feats, mode="video")
+        Train → (logit, *8_aux_logits)   Eval → logit
+        (index 8 = motion_aux, meaningful in video mode only)
+
+    Branch layout (16 total, sum of dims = 1728):
+      Image:  backbone-1536, SRM-64, Freq-128, Color-64, PRNU-96,
+              Spatial-128, Halluc-128, PRNUSpatial-128, GAN-128,
+              CMOS-96, ColorIncon-96, FlowIrreg-96
+      Video:  TemporalFlow-64, PRNUDeep-64, PRNUTemporal-32, MotionGRU-128
+
+    Args:
+        dropout                : dropout rate for classifier (default 0.4)
+        prnu_in_features       : PRNU feature dim (default 64)
+        gradient_checkpointing : save VRAM by checkpointing backbone (default False)
+    """
+
+    _FREEZE_RATIO    = 0.60
+    _IMG_BRANCH_DIMS = [1536, 64, 128, 64, 96, 128, 128, 128, 128, 96, 96, 96]
+    _VID_BRANCH_DIMS = [64, 64, 32, 128]
+    _ALL_DIMS        = _IMG_BRANCH_DIMS + _VID_BRANCH_DIMS   # 16 branches, sum=1728
+
+    def __init__(self, dropout: float = 0.4, prnu_in_features: int = 64,
+                 gradient_checkpointing: bool = False):
+        super().__init__()
+        self.use_ckpt = gradient_checkpointing
+
+        # ── Shared backbone (EfficientNet-B3, bottom 60% frozen) ─────────
+        net = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+        feature_children = list(net.features.children())
+        freeze_until = int(len(feature_children) * self._FREEZE_RATIO)
+        for i, block in enumerate(feature_children):
+            if i < freeze_until:
+                for p in block.parameters():
+                    p.requires_grad_(False)
+        self.backbone    = net.features
+        self.pool        = nn.AdaptiveAvgPool2d((1, 1))
+        self._last_block = feature_children[-1]
+
+        # ── Image branches (identical attribute names to DeepFusionNet) ───
+        self.srm_branch          = SRMBranch(out_features=64)
+        self.freq_branch         = FrequencyBranch(out_features=128)
+        self.color_branch        = ColorForensicsBranch(out_features=64)
+        self.prnu_branch_v2      = PRNUBranchV2(in_features=prnu_in_features, out_features=96)
+        self.spatial_branch      = SpatialCNNBranch(out_features=128)
+        self.halluc_branch       = HallucinationBranch(out_features=128)
+        self.prnu_spatial_branch = PRNUSpatialBranch(out_features=128)
+        self.gan_diff_branch     = GANDiffusionFingerprintBranch(out_features=128)
+        self.cmos_branch         = CMOSCCDSensorBranch(out_features=96)
+        self.color_incon_branch  = ColorChannelInconsistencyBranch(out_features=96)
+        self.flow_branch         = OpticalFlowIrregularityBranch(out_features=96)
+
+        # ── Video-specific branches ───────────────────────────────────────
+        self.temporal_branch      = TemporalFlowBranch(in_channels=6, out_features=64)
+        self.prnu_deep_branch     = PRNUDeepBranch(in_features=64, out_features=64)
+        self.prnu_temporal_branch = PRNUTemporalBranch(in_features=64, out_features=32)
+        self.motion_branch        = MotionTemporalBranch(motion_dim=48, out_features=128)
+
+        # ── Unified gate + fusion (16 branches) ──────────────────────────
+        self.branch_gate = BranchGate(self._ALL_DIMS)
+        self.fusion = CrossAttentionFusion(
+            self._ALL_DIMS, out_dim=768, d_model=192, n_heads=4, n_layers=3
+        )
+
+        # ── Classifier ───────────────────────────────────────────────────
+        self.classifier = nn.Sequential(
+            nn.Linear(768, 384), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(384, 64),  nn.SiLU(), nn.Dropout(dropout * 0.75),
+            nn.Linear(64, 1),
+        )
+
+        # ── Aux heads (training only) ─────────────────────────────────────
+        def _aux(d: int) -> nn.Sequential:
+            return nn.Sequential(nn.Linear(d, 32), nn.SiLU(), nn.Linear(32, 1))
+
+        self.prnu_aux_head         = _aux(96)
+        self.halluc_aux_head       = _aux(128)
+        self.prnu_spatial_aux_head = _aux(128)
+        self.gan_diff_aux_head     = _aux(128)
+        self.cmos_aux_head         = _aux(96)
+        self.color_incon_aux_head  = _aux(96)
+        self.flow_aux_head         = _aux(96)
+        self.motion_aux_head       = _aux(128)   # meaningful in video mode
+
+        self._init_weights()
+
+    # ------------------------------------------------------------------
+
+    def forward(self, img: torch.Tensor, prnu_feats: torch.Tensor,
+                prnu_map: torch.Tensor = None,
+                flow: torch.Tensor = None,
+                prnu_delta: torch.Tensor = None,
+                motion_feats: torch.Tensor = None,
+                mode: str = "image"):
+        B = img.size(0)
+
+        # ── Backbone ─────────────────────────────────────────────────────
+        if self.use_ckpt and self.training:
+            cnn_out = grad_checkpoint(
+                lambda x: self.pool(self.backbone(x)).view(x.size(0), -1),
+                img, use_reentrant=False,
+            )
+        else:
+            cnn_out = self.pool(self.backbone(img)).view(B, -1)          # (B,1536)
+
+        # ── Image branches ────────────────────────────────────────────────
+        srm_out         = self.srm_branch(img)
+        freq_out        = self.freq_branch(img)
+        color_out       = self.color_branch(img)
+        prnu_out        = self.prnu_branch_v2(prnu_feats)
+        spatial_out     = self.spatial_branch(img)
+        halluc_out      = self.halluc_branch(img)
+        if prnu_map is None:
+            prnu_map = torch.zeros(B, 3, 128, 128, device=img.device, dtype=img.dtype)
+        prnu_spatial_out = self.prnu_spatial_branch(prnu_map)
+        gan_diff_out     = self.gan_diff_branch(img)
+        cmos_out         = self.cmos_branch(img)
+        color_incon_out  = self.color_incon_branch(img)
+        flow_irr_out     = self.flow_branch(img)
+
+        # ── Video branches (zeros when mode != "video" or flow is None) ──
+        if mode == "video" and flow is not None:
+            temporal_out  = self.temporal_branch(flow)
+            prnu_deep_out = self.prnu_deep_branch(prnu_feats)
+            prnu_temp_out = self.prnu_temporal_branch(
+                prnu_delta if prnu_delta is not None
+                else torch.zeros_like(prnu_feats)
+            )
+            motion_out = self.motion_branch(
+                motion_feats if motion_feats is not None
+                else torch.zeros(B, 1, 48, device=img.device, dtype=img.dtype)
+            )
+        else:
+            temporal_out  = torch.zeros(B, 64,  device=img.device, dtype=img.dtype)
+            prnu_deep_out = torch.zeros(B, 64,  device=img.device, dtype=img.dtype)
+            prnu_temp_out = torch.zeros(B, 32,  device=img.device, dtype=img.dtype)
+            motion_out    = torch.zeros(B, 128, device=img.device, dtype=img.dtype)
+
+        # ── Gate + fusion ─────────────────────────────────────────────────
+        branch_list = [
+            cnn_out, srm_out, freq_out, color_out,
+            prnu_out, spatial_out, halluc_out, prnu_spatial_out,
+            gan_diff_out, cmos_out, color_incon_out, flow_irr_out,
+            temporal_out, prnu_deep_out, prnu_temp_out, motion_out,
+        ]
+        branch_list = self.branch_gate(branch_list)
+        fused = self.fusion(branch_list)
+        logit = self.classifier(fused)                                   # (B,1)
+
+        if self.training:
+            return (
+                logit,
+                self.prnu_aux_head(prnu_out),
+                self.halluc_aux_head(halluc_out),
+                self.prnu_spatial_aux_head(prnu_spatial_out),
+                self.gan_diff_aux_head(gan_diff_out),
+                self.cmos_aux_head(cmos_out),
+                self.color_incon_aux_head(color_incon_out),
+                self.flow_aux_head(flow_irr_out),
+                self.motion_aux_head(motion_out),
+            )
+        return logit
+
+    def predict_proba(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(logits)
+
+    @property
+    def gradcam_target_layer(self) -> nn.Module:
+        return self._last_block
+
+    def param_summary(self):
+        total     = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen    = total - trainable
+        print(
+            "  UnifiedFusionNet v1  (B3 + SRM×15 + FFT×3 + YCbCr + PRNU-64 + SpatialCNN +\n"
+            "    MobileNetV3 + PRNUSpatialMap + GAN/Diff + CMOS + ColorIncon + FlowIrreg +\n"
+            "    TemporalFlow + PRNUDeep + PRNUTemporal + MotionGRU +\n"
+            "    BranchGate-16 + CrossAttn-192×3×16 + INT8-ready)"
+        )
+        print(f"  Total parameters    : {total:,}")
+        print(f"  Trainable           : {trainable:,}  ({trainable/total*100:.1f}%)")
+        print(f"  Frozen (backbone)   : {frozen:,}  ({frozen/total*100:.1f}%)")
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear) and m.weight.requires_grad:
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv2d) and m.weight.requires_grad:
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.Conv1d) and m.weight.requires_grad:
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+    @classmethod
+    def migrate_from_checkpoints(cls, image_ckpt_path: str,
+                                  video_ckpt_path: str = None,
+                                  device: str = 'cpu') -> 'UnifiedFusionNet':
+        """
+        Build a UnifiedFusionNet pre-loaded from existing separate checkpoints.
+
+        DeepFusionNet keys map directly (same attribute names for all image branches).
+        VideoTemporalFusionNet video-specific keys are remapped:
+          prnu_branch.*  → prnu_deep_branch.*   (renamed in UnifiedFusionNet)
+          all others     → unchanged             (temporal_branch, motion_branch, etc.)
+        """
+        net = cls()
+        if image_ckpt_path and os.path.exists(image_ckpt_path):
+            sd = torch.load(image_ckpt_path, map_location=device)
+            if 'model_state_dict' in sd:
+                sd = sd['model_state_dict']
+            elif 'model_state' in sd:
+                sd = sd['model_state']
+            net.load_state_dict(sd, strict=False)
+            print(f"  Loaded image weights from {image_ckpt_path}")
+        if video_ckpt_path and os.path.exists(video_ckpt_path):
+            sd = torch.load(video_ckpt_path, map_location=device)
+            if 'model_state_dict' in sd:
+                sd = sd['model_state_dict']
+            elif 'model_state' in sd:
+                sd = sd['model_state']
+            remapped = {}
+            for k, v in sd.items():
+                if k.startswith('prnu_branch.'):
+                    remapped['prnu_deep_branch.' + k[len('prnu_branch.'):]] = v
+                else:
+                    remapped[k] = v
+            net.load_state_dict(remapped, strict=False)
+            print(f"  Loaded video weights from {video_ckpt_path}")
+        return net
+
+
+# Alias
+UnifiedDetector = UnifiedFusionNet
+
+
+# ---------------------------------------------------------------------------
 #  Legacy shim
 # ---------------------------------------------------------------------------
 
@@ -1239,13 +1563,13 @@ class PyTorchCNN(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    print("Running DeepFusionNet v6 sanity check...")
-    model = DeepFusionNet()
+    print("Running DeepFusionNet v6.1 sanity check...")
+    model = DeepFusionNet(prnu_in_features=64, gradient_checkpointing=True)
     model.param_summary()
 
     img  = torch.randn(2, 3, 512, 512)
-    prnu = torch.rand(2, 32)
-    pmap = torch.randn(2, 3, 64, 64)
+    prnu = torch.randn(2, 64)
+    pmap = torch.randn(2, 3, 128, 128)
 
     model.train()
     with torch.enable_grad():
@@ -1265,4 +1589,9 @@ if __name__ == '__main__':
         out2 = model(img, prnu)
     assert out2.shape == (2, 1)
     print("  Backward-compat (no prnu_map): PASSED")
-    print("DeepFusionNet v6 sanity check PASSED ✓")
+
+    # INT8 quantization
+    import model_prnu as m
+    qnet = m.quantize_model_for_inference(model)
+    print(f"  Quantized OK: {type(qnet).__name__}")
+    print("DeepFusionNet v6.1 sanity check PASSED ✓")

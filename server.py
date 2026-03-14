@@ -1,6 +1,7 @@
 """
-AI Detector Server v3.0
+AI Detector Server v4.0
 Flask REST API with full Apple format support (HEIC, HEVC, ProRAW).
+Now with RAG (Retrieval-Augmented Generation) and CAG (Cache-Augmented Generation).
 
 Endpoints:
   POST /analyze          — full image analysis (JPEG, PNG, HEIC, WEBP…)
@@ -9,6 +10,24 @@ Endpoints:
   POST /analyze/batch    — analyse multiple images in one request
   GET  /health           — server and model status
   GET  /capabilities     — list supported formats and model info
+
+  RAG endpoints:
+  GET  /rag/stats        — RAG vector store statistics
+  POST /rag/add          — manually add a labeled example to the RAG store
+  POST /rag/clear        — clear all RAG store entries
+
+  CAG endpoints:
+  GET  /cache/stats      — detection cache statistics
+  POST /cache/clear      — clear all cached results
+
+  RAG query params (on /analyze and /analyze/batch):
+  ?rag=true              — retrieve similar past cases and augment probability
+  ?explain=true          — add LLM explanation to the response
+
+  LLM config (environment variables):
+  OLLAMA_URL             — Ollama base URL  (default: http://localhost:11434)
+  OLLAMA_MODEL           — Ollama model     (default: llama3.2)
+  OPENAI_API_KEY         — enables OpenAI backend (fallback if Ollama absent)
 """
 
 import sys
@@ -17,6 +36,7 @@ import io
 import base64
 import time
 import traceback
+import numpy as np
 from flask import Flask, request, jsonify
 
 # ── Apple HEIC/HEIF support via pillow-heif ──────────────────────────────────
@@ -33,12 +53,16 @@ from PIL import Image
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from detect import Detector
+from rag_store import ImageRAGStore
+from cag_cache import DetectionCache
+from llm_explainer import LLMExplainer
+from umfre import ForensicRecoverer
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024   # 50 MB (HEIC files are large)
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB (video + HEIC files)
 
 # ── Model version ─────────────────────────────────────────────────────────────
-MODEL_VERSION = "3.0-PRNUFusion"
+MODEL_VERSION = "4.0-RAG+CAG"
 
 # Formats natively supported by PIL + pillow-heif
 SUPPORTED_FORMATS = [
@@ -56,6 +80,19 @@ try:
 except FileNotFoundError as e:
     print(f"CRITICAL: Could not initialise detector.\n  {e}")
     detector = None
+
+# ── RAG + CAG init ────────────────────────────────────────────────────────────
+rag_store = ImageRAGStore()
+det_cache = DetectionCache()
+umfre_engine = ForensicRecoverer(device='cpu', denoise_method='auto',
+                                 tile_size=1024, verbose=False)
+try:
+    llm_explainer = LLMExplainer()
+    print(f"✓ LLMExplainer ready — backend={llm_explainer.info()['backend']}, "
+          f"chunks={llm_explainer.info()['knowledge_chunks']}")
+except Exception as _e:
+    print(f"⚠  LLMExplainer init failed: {_e}")
+    llm_explainer = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,14 +123,107 @@ def _decode_image(file_storage) -> bytes:
     return raw
 
 
-def _run_analysis(image_data: bytes, want_heatmap: bool,
-                  platform: str = None) -> dict:
-    """Run detector and add server-level metadata."""
+def _run_analysis(
+    image_data: bytes,
+    want_heatmap: bool,
+    platform: str = None,
+    use_rag: bool = False,
+    want_explain: bool = False,
+) -> dict:
+    """
+    Run detector with optional CAG cache lookup, RAG augmentation, and LLM explanation.
+
+    Flow
+    ----
+    1. CAG cache lookup  →  hit: return instantly (no model inference)
+    2. Detector inference  (with optional 768-dim embedding capture for RAG)
+    3. RAG retrieve similar past cases  →  augment probability
+    4. LLM explanation  →  natural-language explanation field
+    5. Store result in CAG cache + auto-index embedding in RAG store
+    """
     t0 = time.perf_counter()
-    result = detector.predict(image_data, compute_heatmap=want_heatmap,
-                              platform=platform)
-    result["inference_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+    # ── 1. CAG: check cache ───────────────────────────────────────────────────
+    cached = det_cache.lookup(image_data)
+    if cached is not None:
+        cached["inference_ms"]   = round((time.perf_counter() - t0) * 1000, 1)
+        cached["server_version"] = MODEL_VERSION
+        # Still run explain on cached result if requested and not already there
+        if want_explain and "explanation" not in cached and llm_explainer:
+            try:
+                cached["explanation"] = llm_explainer.explain(cached)
+            except Exception:
+                pass
+        return cached
+
+    # ── 2. Detector inference (optionally capture fusion embedding) ───────────
+    embedding  = None
+    import torch
+
+    if use_rag and detector and detector.use_fusion and hasattr(detector.model, 'fusion'):
+        _captured: dict = {}
+
+        def _emb_hook(module, inp, out):
+            if isinstance(out, torch.Tensor):
+                _captured['emb'] = out.detach().cpu().float().numpy()
+
+        _handle = detector.model.fusion.register_forward_hook(_emb_hook)
+        try:
+            result = detector.predict(image_data, compute_heatmap=want_heatmap,
+                                      platform=platform)
+        finally:
+            _handle.remove()
+
+        raw = _captured.get('emb')
+        if raw is not None:
+            embedding = raw[0] if raw.ndim == 2 else raw   # (768,)
+    else:
+        result = detector.predict(image_data, compute_heatmap=want_heatmap,
+                                  platform=platform)
+
+    result["inference_ms"]   = round((time.perf_counter() - t0) * 1000, 1)
     result["server_version"] = MODEL_VERSION
+
+    # ── 3. RAG: retrieve neighbors + augment probability ─────────────────────
+    neighbors = []
+    if use_rag and embedding is not None and "ai_probability" in result:
+        neighbors = rag_store.retrieve(embedding, k=5)
+        if neighbors:
+            aug_prob = rag_store.augment_probability(
+                result["ai_probability"], neighbors
+            )
+            result["ai_probability_raw"] = result["ai_probability"]
+            result["ai_probability"]     = round(aug_prob, 4)
+            result["conclusion"]         = "AI-Generated" if aug_prob > 0.5 else "REAL"
+            result["rag_neighbors"] = [
+                {
+                    "verdict":    n["verdict"],
+                    "confidence": round(n["confidence"], 3),
+                    "distance":   round(n["distance"], 2),
+                }
+                for n in neighbors
+            ]
+
+    # ── 4. LLM explanation ────────────────────────────────────────────────────
+    if want_explain and llm_explainer:
+        try:
+            result["explanation"] = llm_explainer.explain(result, neighbors or None)
+        except Exception as e:
+            result["explanation"] = f"[explanation unavailable: {e}]"
+
+    # ── 5. Store in CAG cache + auto-index embedding in RAG store ─────────────
+    det_cache.store(image_data, result)
+
+    if embedding is not None and "ai_probability" in result:
+        try:
+            rag_store.add(
+                embedding=embedding,
+                verdict=result["conclusion"],
+                confidence=result.get("ai_probability", 0.5),
+            )
+        except Exception:
+            pass
+
     return result
 
 
@@ -104,12 +234,15 @@ def health():
     if detector is None:
         return jsonify({"status": "error", "message": "Detector not initialised"}), 503
     return jsonify({
-        "status":         "ok",
-        "model":          _model_type,
-        "model_version":  MODEL_VERSION,
-        "heic_support":   _HEIC_SUPPORT,
-        "prnu_enabled":   True,
-        "gradcam":        True,
+        "status":           "ok",
+        "model":            _model_type,
+        "model_version":    MODEL_VERSION,
+        "heic_support":     _HEIC_SUPPORT,
+        "prnu_enabled":     True,
+        "gradcam":          True,
+        "rag":              rag_store.stats(),
+        "cache":            det_cache.stats(),
+        "llm_explainer":    llm_explainer.info() if llm_explainer else None,
     })
 
 
@@ -178,10 +311,15 @@ def analyze():
 
     want_heatmap = request.args.get('heatmap', 'true').lower() != 'false'
     platform     = request.args.get('platform', None)
+    use_rag      = request.args.get('rag',     'false').lower() == 'true'
+    want_explain = request.args.get('explain', 'false').lower() == 'true'
 
     try:
         image_data = _decode_image(request.files['image'])
-        return jsonify(_run_analysis(image_data, want_heatmap, platform=platform))
+        return jsonify(_run_analysis(
+            image_data, want_heatmap,
+            platform=platform, use_rag=use_rag, want_explain=want_explain,
+        ))
     except ValueError as e:
         return jsonify({"error": str(e)}), 415
     except Exception as e:
@@ -300,24 +438,296 @@ def analyze_batch():
     if len(files) > 8:
         return jsonify({"error": "Maximum 8 images per batch."}), 400
 
-    platform = request.args.get('platform', None)
-    results  = []
+    platform     = request.args.get('platform', None)
+    use_rag      = request.args.get('rag',     'false').lower() == 'true'
+    want_explain = request.args.get('explain', 'false').lower() == 'true'
+    results = []
     for f in files:
         try:
             image_data = _decode_image(f)
-            r = _run_analysis(image_data, want_heatmap=False, platform=platform)
-            results.append({
-                "filename":            f.filename,
-                "ai_probability":      r.get("ai_probability"),
-                "conclusion":          r.get("conclusion"),
-                "inference_ms":        r.get("inference_ms"),
-                "prnu_analysis":       r.get("prnu_analysis"),
+            r = _run_analysis(
+                image_data, want_heatmap=False,
+                platform=platform, use_rag=use_rag, want_explain=want_explain,
+            )
+            entry = {
+                "filename":             f.filename,
+                "ai_probability":       r.get("ai_probability"),
+                "conclusion":           r.get("conclusion"),
+                "inference_ms":         r.get("inference_ms"),
+                "prnu_analysis":        r.get("prnu_analysis"),
                 "platform_compression": r.get("platform_compression"),
-            })
+                "cache_hit":            r.get("cache_hit", False),
+            }
+            if use_rag and "rag_neighbors" in r:
+                entry["rag_neighbors"]        = r["rag_neighbors"]
+                entry["ai_probability_raw"]   = r.get("ai_probability_raw")
+            if want_explain and "explanation" in r:
+                entry["explanation"] = r["explanation"]
+            results.append(entry)
         except Exception as e:
             results.append({"filename": f.filename, "error": str(e)})
 
     return jsonify({"results": results})
+
+
+# ── Compression analysis (UMFRE) ──────────────────────────────────────────────
+
+@app.route('/analyze/compression', methods=['POST'])
+def analyze_compression():
+    """
+    Analyze the compression history of an uploaded image or video.
+
+    Accepts
+    -------
+    Multipart form-data  field 'file' or 'image'  (images and videos)
+    Raw bytes body       Content-Type: application/octet-stream
+
+    Supported formats
+    -----------------
+    Images:  JPEG, PNG, WebP, HEIC, HEIF, AVIF
+    Videos:  MP4 (H.264/H.265/AV1), WebM (VP8/VP9), MOV, MKV
+
+    Returns JSON with:
+      format, dimensions, media_type         — basic media info
+      ── JPEG ────────────────────────────────────────────────
+      jpeg_quality, chroma_subsampling        — quality factor + chroma
+      is_progressive, has_restart_markers     — bitstream scan flags
+      huffman_optimized                       — non-standard Huffman tables
+      encoder_signature, encoder_confidence   — encoder fingerprint
+      encoder_candidates                      — ranked encoder list
+      double_jpeg, estimated_q1               — double-compression detection
+      dct_periodicity_score                   — DCT histogram peak strength
+      quantization_tables                     — embedded Q-tables
+      ── PNG ─────────────────────────────────────────────────
+      png_compression                         — zlib compression level (0-9)
+      ── WebP ────────────────────────────────────────────────
+      webp_type, webp_lossless               — VP8 | VP8L | VP8X
+      webp_has_alpha, webp_animated          — extended WebP flags
+      webp_quality_estimate                  — estimated lossy quality
+      ── HEIC / HEIF / AVIF ──────────────────────────────────
+      heif_brand                             — heic | heix | avif | mif1
+      heif_chroma, heif_bit_depth            — chroma subsampling, bit depth
+      av1_film_grain, av1_seq_profile        — AV1-specific flags
+      ── Video (H.264 / H.265 / AV1 / VP9 / VP8) ─────────────
+      video_codec, video_profile, video_level — codec identity
+      video_bit_depth, pixel_format           — sample format
+      bitrate_kbps, bits_per_pixel            — bitrate metrics
+      quality_tier                            — high | medium | low
+      container_format, streams_info          — container + all streams
+      re_encoding_detected, re_encoding_evidence — transcoding detection
+      color_primaries, transfer_characteristics  — colour space info
+      gop_mean, gop_std, transcoding_detected — GOP structure (video)
+      mv_entropy                              — motion-vector entropy
+      ── Common ──────────────────────────────────────────────
+      metadata_stripped, stripping_evidence  — EXIF stripping detection
+      notes                                  — human-readable summary
+      inference_ms                           — server processing time (ms)
+    """
+    import tempfile
+
+    try:
+        # Accept raw body or multipart ('file' or 'image' field)
+        if request.content_type and 'octet-stream' in request.content_type:
+            raw = request.get_data()
+            ext = '.bin'
+        elif 'file' in request.files:
+            f   = request.files['file']
+            raw = f.read()
+            ext = os.path.splitext(f.filename or '.bin')[1] or '.bin'
+        elif 'image' in request.files:
+            f   = request.files['image']
+            raw = f.read()
+            ext = os.path.splitext(f.filename or '.jpg')[1] or '.jpg'
+        else:
+            return jsonify({"error": "Send file as body (octet-stream) or 'file'/'image' form field."}), 400
+
+        t0 = time.perf_counter()
+
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+
+        try:
+            media_info = umfre_engine.ingest(tmp_path)
+            comp       = umfre_engine.analyze_compression(media_info)
+        finally:
+            os.unlink(tmp_path)
+
+        elapsed = round((time.perf_counter() - t0) * 1000, 1)
+
+        return jsonify({
+            # ── Media basics ─────────────────────────────────────────────────
+            "format":               media_info.format,
+            "media_type":           media_info.media_type,
+            "dimensions":           f"{media_info.width}×{media_info.height}",
+            "color_space":          media_info.color_space,
+            "frame_count":          media_info.frame_count,
+            "fps":                  media_info.fps or None,
+            # ── JPEG-specific ────────────────────────────────────────────────
+            "jpeg_quality":         comp.jpeg_quality_current,
+            "chroma_subsampling":   comp.chroma_subsampling if comp.chroma_subsampling != "unknown" else None,
+            "is_progressive":       comp.is_progressive,
+            "has_restart_markers":  comp.has_restart_markers,
+            "huffman_optimized":    comp.huffman_optimized,
+            "encoder_signature":    comp.encoder_signature if comp.encoder_signature != "unknown" else None,
+            "encoder_confidence":   comp.encoder_confidence or None,
+            "encoder_candidates":   comp.encoder_candidates or None,
+            # ── Double-JPEG detection ────────────────────────────────────────
+            "double_jpeg":          comp.double_jpeg_detected,
+            "estimated_q1":         comp.estimated_q1,
+            "dct_periodicity_score": comp.dct_periodicity_score or None,
+            "quantization_tables":  comp.quantization_tables or None,
+            # ── PNG ──────────────────────────────────────────────────────────
+            "png_compression":      comp.png_compression,
+            # ── WebP ─────────────────────────────────────────────────────────
+            "webp_type":            comp.webp_type,
+            "webp_lossless":        comp.webp_lossless,
+            "webp_has_alpha":       comp.webp_has_alpha or None,
+            "webp_animated":        comp.webp_animated or None,
+            "webp_quality_estimate": comp.webp_quality_estimate,
+            # ── HEIC / HEIF / AVIF ───────────────────────────────────────────
+            "heif_brand":           comp.heif_brand,
+            "heif_chroma":          comp.heif_chroma,
+            "heif_bit_depth":       comp.heif_bit_depth,
+            "av1_film_grain":       comp.av1_film_grain or None,
+            "av1_seq_profile":      comp.av1_seq_profile,
+            # ── Video codec ──────────────────────────────────────────────────
+            "video_codec":          comp.video_codec,
+            "video_profile":        comp.video_profile,
+            "video_level":          comp.video_level,
+            "video_bit_depth":      comp.video_bit_depth,
+            "pixel_format":         comp.pixel_format,
+            "bitrate_kbps":         comp.bitrate_kbps,
+            "bits_per_pixel":       comp.bits_per_pixel,
+            "quality_tier":         comp.quality_tier,
+            "container_format":     comp.container_format,
+            "streams_info":         comp.streams_info or None,
+            # ── Re-encoding / transcoding ────────────────────────────────────
+            "re_encoding_detected": comp.re_encoding_detected or None,
+            "re_encoding_evidence": comp.re_encoding_evidence or None,
+            # ── Color ────────────────────────────────────────────────────────
+            "color_primaries":      comp.color_primaries,
+            "transfer_characteristics": comp.transfer_characteristics,
+            # ── Video GOP ────────────────────────────────────────────────────
+            "gop_mean":             comp.gop_mean or None,
+            "gop_std":              comp.gop_std or None,
+            "transcoding_detected": comp.transcoding_detected or None,
+            "mv_entropy":           comp.mv_entropy or None,
+            # ── Metadata ─────────────────────────────────────────────────────
+            "metadata_stripped":    media_info.metadata_stripped,
+            "stripping_evidence":   media_info.stripping_evidence or None,
+            # ── Summary ──────────────────────────────────────────────────────
+            "notes":                comp.notes,
+            "inference_ms":         elapsed,
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ── RAG management ────────────────────────────────────────────────────────────
+
+@app.route('/rag/stats', methods=['GET'])
+def rag_stats():
+    """Return RAG vector store statistics."""
+    return jsonify(rag_store.stats())
+
+
+@app.route('/rag/add', methods=['POST'])
+def rag_add():
+    """
+    Manually add a labeled image to the RAG store.
+
+    Multipart form:
+        image    — image file
+        verdict  — "AI-Generated" or "REAL"
+
+    Query params:
+        ?rag=true  must be set (safety gate)
+    """
+    if request.args.get('rag', 'false').lower() != 'true':
+        return jsonify({"error": "Pass ?rag=true to confirm RAG indexing."}), 400
+
+    if 'image' not in request.files:
+        return jsonify({"error": "No 'image' field."}), 400
+
+    verdict = (request.form.get('verdict') or '').strip()
+    if verdict not in ('AI-Generated', 'REAL'):
+        return jsonify({"error": "verdict must be 'AI-Generated' or 'REAL'"}), 400
+
+    if detector is None:
+        return jsonify({"error": "Detector not initialised"}), 500
+
+    try:
+        import torch
+        image_data = _decode_image(request.files['image'])
+
+        # Extract embedding via fusion hook
+        _captured: dict = {}
+        if detector.use_fusion and hasattr(detector.model, 'fusion'):
+            def _hook(module, inp, out):
+                if isinstance(out, torch.Tensor):
+                    _captured['emb'] = out.detach().cpu().float().numpy()
+            handle = detector.model.fusion.register_forward_hook(_hook)
+            try:
+                result = detector.predict(image_data, compute_heatmap=False)
+            finally:
+                handle.remove()
+        else:
+            result = detector.predict(image_data, compute_heatmap=False)
+
+        raw = _captured.get('emb')
+        if raw is None:
+            return jsonify({"error": "Could not extract embedding (non-fusion model)."}), 500
+
+        emb    = raw[0] if raw.ndim == 2 else raw
+        row_id = rag_store.add(
+            emb, verdict=verdict,
+            confidence=result.get("ai_probability", 0.5),
+            metadata={"source": "manual"},
+        )
+        return jsonify({
+            "ok":         True,
+            "row_id":     row_id,
+            "verdict":    verdict,
+            "rag_stats":  rag_store.stats(),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/rag/clear', methods=['POST'])
+def rag_clear():
+    """Clear all RAG store entries."""
+    rag_store.clear()
+    return jsonify({"ok": True, "rag_stats": rag_store.stats()})
+
+
+# ── CAG (cache) management ────────────────────────────────────────────────────
+
+@app.route('/cache/stats', methods=['GET'])
+def cache_stats():
+    """Return detection cache statistics."""
+    return jsonify(det_cache.stats())
+
+
+@app.route('/cache/clear', methods=['POST'])
+def cache_clear():
+    """Clear all cached detection results."""
+    det_cache.clear()
+    return jsonify({"ok": True, "cache_stats": det_cache.stats()})
+
+
+# ── LLM explainer info ────────────────────────────────────────────────────────
+
+@app.route('/explain/info', methods=['GET'])
+def explain_info():
+    """Return LLM explainer backend info."""
+    if llm_explainer is None:
+        return jsonify({"error": "LLMExplainer not initialised"}), 503
+    return jsonify(llm_explainer.info())
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -328,13 +738,25 @@ def main():
         return
 
     print(f"\n  AI Detector Server v{MODEL_VERSION}")
-    print(f"  HEIC support : {'✓ enabled' if _HEIC_SUPPORT else '✗ disabled'}")
-    print("  POST /analyze          — full analysis (JPEG, PNG, HEIC, WEBP…)")
-    print("  POST /analyze/heic     — HEIC/ProRAW direct (Swift-optimised)")
-    print("  POST /analyze/frame    — fast frame (no heatmap)")
-    print("  POST /analyze/batch    — up to 8 images")
-    print("  GET  /health           — server status")
-    print("  GET  /capabilities     — formats and model info")
+    print(f"  HEIC support   : {'✓ enabled' if _HEIC_SUPPORT else '✗ disabled'}")
+    _llm_be = llm_explainer.info()['backend'] if llm_explainer else 'unavailable'
+    print(f"  LLM backend    : {_llm_be}")
+    print(f"  RAG store      : {rag_store.stats()['total_cases']} cases indexed")
+    print(f"  Cache          : {det_cache.stats()['db_entries']} entries persisted")
+    print()
+    print("  POST /analyze/compression  — compression history (JPEG/PNG/WebP/HEIC/HEIF/AVIF/MP4/WebM/H.264/H.265/AV1/VP9/VP8)")
+    print("  POST /analyze              — full analysis (?rag=true &explain=true)")
+    print("  POST /analyze/heic         — HEIC/ProRAW direct (Swift-optimised)")
+    print("  POST /analyze/frame        — fast frame (no heatmap)")
+    print("  POST /analyze/batch        — up to 8 images (?rag=true &explain=true)")
+    print("  GET  /health               — server + RAG + cache status")
+    print("  GET  /capabilities         — formats and model info")
+    print("  GET  /rag/stats            — RAG vector store stats")
+    print("  POST /rag/add?rag=true     — manually index a labeled image")
+    print("  POST /rag/clear            — clear RAG store")
+    print("  GET  /cache/stats          — cache stats")
+    print("  POST /cache/clear          — clear cache")
+    print("  GET  /explain/info         — LLM explainer info")
     print("  Listening on http://0.0.0.0:8080\n")
     app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
 

@@ -2,6 +2,7 @@ import os
 import io
 import base64
 import sys
+import random
 import numpy as np
 from PIL import Image
 
@@ -10,9 +11,9 @@ import torch.nn as nn
 from torchvision import transforms
 
 # Model definitions
-from model_prnu import DeepFusionNet, EfficientFusionNet, PRNUFusionNet
+from model_prnu import DeepFusionNet, EfficientFusionNet, PRNUFusionNet, UnifiedFusionNet
 from prnu import analyze_prnu, extract_noise_residual
-from prnu_features import extract_prnu_features_fullres
+from prnu_features import extract_prnu_features, extract_prnu_features_fullres
 from image_loader import UniversalImageLoader
 from prnu_recovery import build_prnu_recovery_net
 
@@ -77,7 +78,8 @@ _PLATFORM_ALIASES = {
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(SCRIPT_DIR, '..', 'models')
 
-# Model paths — try v6 first, then v5, then legacy
+# Model paths — try unified first, then v6/v5, then legacy
+UNIFIED_MODEL_PATH = os.path.join(MODELS_DIR, 'ai_detector_unified_v1.pth')
 V6_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion_v6.pth')
 V5_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion_v5.pth')
 V4_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion.pth')
@@ -221,8 +223,9 @@ class Detector:
     Main inference class.
 
     Load order:
-      1. ai_detector_prnu_fusion_v6.pth → DeepFusionNet v6 (12-branch, 32-dim PRNU)
-      2. ai_detector_prnu_fusion_v5.pth → DeepFusionNet v5 (8-branch,  32-dim PRNU)
+      0. ai_detector_unified_v1.pth    → UnifiedFusionNet v1 (16-branch, 64-dim PRNU)
+      1. ai_detector_prnu_fusion_v6.pth → DeepFusionNet v6 (12-branch, 64-dim PRNU)
+      2. ai_detector_prnu_fusion_v5.pth → DeepFusionNet v5 (8-branch,  64-dim PRNU)
       3. ai_detector_prnu_fusion.pth    → DeepFusionNet v5 (if new arch keys)
                                         → falls through if old v4 keys
       4. ai_detector_model_pytorch.pth  → legacy PyTorchCNN fallback
@@ -248,6 +251,25 @@ class Detector:
         except Exception as e:
             print(f"  PRNU recovery net unavailable: {e}")
             self.recovery_net = None
+
+        # --- Step 0: try UnifiedFusionNet v1 ---
+        if os.path.exists(UNIFIED_MODEL_PATH):
+            try:
+                model = UnifiedFusionNet(prnu_in_features=64).to(self.device)
+                sd = torch.load(UNIFIED_MODEL_PATH, map_location=self.device,
+                                weights_only=True)
+                model.load_state_dict(sd.get('model_state_dict', sd), strict=False)
+                model.eval()
+                self.model       = model
+                self.prnu_dim    = 64
+                self._model_type = 'UnifiedFusionNet v1'
+                self.use_fusion  = True
+                print(f"  Loaded UnifiedFusionNet v1 from {UNIFIED_MODEL_PATH}")
+                # Grad-CAM target layer
+                self.gradcam_layer = self.model.gradcam_target_layer
+                return
+            except Exception as e:
+                print(f"  UnifiedFusionNet load failed: {e} — falling back")
 
         # --- Try DeepFusionNet v6/v5 ---
         for model_path in (V6_MODEL_PATH, V5_MODEL_PATH, V4_MODEL_PATH):
@@ -419,6 +441,177 @@ class Detector:
                 result["heatmap_height"] = orig_h
 
         return result
+
+    # ------------------------------------------------------------------
+
+    def predict_video(
+        self,
+        video_path: str,
+        n_screen_frames: int = 8,
+        n_full_frames: int = 24,
+        screen_threshold: float = 0.35,
+        platform: str = None,
+    ) -> dict:
+        """
+        Cascade video AI detection.
+
+        Stage 1 — Quick PRNU screen on n_screen_frames random frames.
+                   Uses fast 8-dim PRNU features only.
+                   If the AI score is below screen_threshold → return early as REAL.
+
+        Stage 2 — Full frame-by-frame analysis.
+                   Runs the image model on n_full_frames + measures PRNU
+                   temporal consistency across frames.
+
+        Args:
+            video_path       : path to local video file
+            n_screen_frames  : frames sampled in Stage 1
+            n_full_frames    : frames analysed in Stage 2
+            screen_threshold : Stage 1 AI score above which Stage 2 runs (0–1)
+            platform         : optional platform hint (same as predict())
+
+        Returns dict with keys:
+            ai_probability, conclusion, method, frames_analyzed,
+            stage1_score, frame_model_probability,
+            prnu_temporal_consistency, frame_scores, model_type,
+            platform_compression (if platform given)
+        """
+        import cv2
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return {"error": f"Cannot open video: {video_path}"}
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < 1:
+            cap.release()
+            return {"error": "Video has no readable frames."}
+
+        # ── Stage 1: Quick PRNU screen ────────────────────────────────
+        n_s1 = min(n_screen_frames, total_frames)
+        screen_indices = sorted(random.sample(range(total_frames), n_s1))
+        stage1_scores = []
+
+        for fi in screen_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            try:
+                small = cv2.resize(frame, (256, 256))
+                arr   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float64) / 255.0
+                feats = extract_prnu_features(arr)          # 8-dim fast
+                # feats[0] noise_strength  — real cameras: high
+                # feats[1] noise_uniformity — AI: high (flat noise)
+                # feats[3] freq_energy_ratio — real: high HF content
+                noise_strength  = float(np.clip(feats[0] * 10.0, 0.0, 1.0))
+                noise_uniformity = float(feats[1])
+                freq_ratio      = float(feats[3])
+                # Low noise strength, uniform distribution, missing HF = AI-like
+                score = (
+                    noise_uniformity          * 0.50
+                    + (1.0 - noise_strength)  * 0.30
+                    + (1.0 - freq_ratio)      * 0.20
+                )
+                stage1_scores.append(float(np.clip(score, 0.0, 1.0)))
+            except Exception:
+                pass
+
+        stage1_ai_score = float(np.mean(stage1_scores)) if stage1_scores else 0.5
+
+        if stage1_ai_score < screen_threshold:
+            cap.release()
+            return {
+                "ai_probability":  round(stage1_ai_score, 4),
+                "conclusion":      "REAL",
+                "method":          "cascade_stage1_prnu_screen",
+                "frames_analyzed": len(stage1_scores),
+                "stage1_score":    round(stage1_ai_score, 4),
+                "model_type":      self._model_type,
+            }
+
+        # ── Stage 2: Full frame-by-frame analysis ─────────────────────
+        n_s2 = min(n_full_frames, total_frames)
+        full_indices = sorted(random.sample(range(total_frames), n_s2))
+        frame_scores  = []
+        prnu_vectors  = []
+
+        for fi in full_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            try:
+                rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb)
+
+                # Run image model on this frame
+                buf = io.BytesIO()
+                pil_img.save(buf, format='JPEG', quality=95)
+                frame_result = self.predict(
+                    buf.getvalue(), compute_heatmap=False, platform=platform
+                )
+                if "ai_probability" in frame_result:
+                    frame_scores.append(frame_result["ai_probability"])
+
+                # Extract 64-dim PRNU for temporal consistency check
+                try:
+                    pv = extract_prnu_features_fullres(
+                        pil_img, tile_size=256,
+                        recovery_net=None, device=self.device,
+                    )
+                    prnu_vectors.append(pv)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        cap.release()
+
+        if not frame_scores:
+            return {"error": "No frames could be analysed in Stage 2."}
+
+        # PRNU temporal consistency — real cameras have a stable sensor
+        # fingerprint across all frames; AI video lacks this.
+        prnu_consistency = 0.5          # neutral default
+        if len(prnu_vectors) >= 2:
+            vecs    = np.stack(prnu_vectors)                     # (N, 64)
+            norms_a = np.linalg.norm(vecs[:-1], axis=1, keepdims=True) + 1e-8
+            norms_b = np.linalg.norm(vecs[1:],  axis=1, keepdims=True) + 1e-8
+            cos_sim = np.sum(
+                (vecs[:-1] / norms_a) * (vecs[1:] / norms_b), axis=1
+            )
+            prnu_consistency = float(np.clip(np.mean(cos_sim), 0.0, 1.0))
+
+        frame_ai_prob  = float(np.mean(frame_scores))
+        prnu_ai_score  = 1.0 - prnu_consistency   # low consistency = more AI-like
+        combined       = 0.70 * frame_ai_prob + 0.30 * prnu_ai_score
+
+        # Platform annotation
+        platform_info = None
+        if platform:
+            key     = _PLATFORM_ALIASES.get(platform.lower(), platform.lower())
+            profile = PLATFORM_PROFILES.get(key)
+            if profile:
+                platform_info = {
+                    "platform":         key,
+                    "tier":             profile['tier'],
+                    "prnu_reliability": profile['prnu_reliability'],
+                    "description":      profile['description'],
+                }
+
+        return {
+            "ai_probability":            round(combined, 4),
+            "conclusion":                "AI-Generated" if combined > 0.5 else "REAL",
+            "method":                    "cascade_stage2_full",
+            "frames_analyzed":           len(frame_scores),
+            "stage1_score":              round(stage1_ai_score, 4),
+            "frame_model_probability":   round(frame_ai_prob, 4),
+            "prnu_temporal_consistency": round(prnu_consistency, 4),
+            "frame_scores":              [round(s, 4) for s in frame_scores],
+            "model_type":                self._model_type,
+            "platform_compression":      platform_info,
+        }
 
     # ------------------------------------------------------------------
     #  Internal helpers

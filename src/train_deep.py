@@ -65,8 +65,9 @@ from torchvision import transforms
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from model_prnu import EfficientFusionNet, VideoTemporalFusionNet
+from model_prnu import UnifiedFusionNet
 from live_plot import LivePlot
+from training_dashboard import TrainingDashboard
 from prnu_features import (
     extract_prnu_features,
     extract_prnu_features_fullres,
@@ -90,10 +91,11 @@ MODELS_DIR     = os.path.join(SCRIPT_DIR, '..', 'models')
 TEMP_FRAMES    = os.path.join(DATA_DIR, 'temp_frames')
 TRAINED_FILE   = os.path.join(MODELS_DIR, 'trained_data.json')
 
-IMAGE_MODEL_PATH    = os.path.join(MODELS_DIR, 'ai_detector_image_deep.pth')
+UNIFIED_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_unified_v1.pth')
+IMAGE_MODEL_PATH    = os.path.join(MODELS_DIR, 'ai_detector_image_deep.pth')   # kept for compat
 IMAGE_MODEL_TS      = os.path.join(MODELS_DIR, 'ai_detector_image_deep_script.ts')
 IMAGE_MODEL_QUANT   = os.path.join(MODELS_DIR, 'ai_detector_image_deep_int8.pt')
-VIDEO_MODEL_PATH    = os.path.join(MODELS_DIR, 'ai_detector_video_deep.pth')
+VIDEO_MODEL_PATH    = os.path.join(MODELS_DIR, 'ai_detector_video_deep.pth')   # kept for compat
 VIDEO_MODEL_TS      = os.path.join(MODELS_DIR, 'ai_detector_video_deep_script.ts')
 VIDEO_CKPT_PATH     = os.path.join(MODELS_DIR, 'ai_detector_video_deep_ckpt.pth')
 
@@ -128,33 +130,81 @@ if device.type == 'cuda':
 #  External Downloading & Streaming
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _download_youtube_video(url, output_dir=TEMP_FRAMES):
+def _download_youtube_video(url, output_dir=TEMP_FRAMES, section_minutes=None):
     """
     Downloads a YouTube video using yt-dlp to output_dir.
+
+    section_minutes : if set, only download that many minutes from the start
+                      (uses --download-sections, requires ffmpeg).
     Returns the absolute path to the downloaded video file.
     """
     import yt_dlp
     os.makedirs(output_dir, exist_ok=True)
     out_tmpl = os.path.join(output_dir, '%(id)s.%(ext)s')
-    
+
     ydl_opts = {
-        # Prioritise H.264 (avc) because OpenCV often lacks software/hardware support for AV1/VP9 out of the box.
-        'format': 'bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+        # Best quality video + audio, merged to mp4 via ffmpeg.
+        # No codec/resolution restriction — get the highest available quality.
+        'format': 'bestvideo+bestaudio/best',
+        'merge_output_format': 'mp4',
         'outtmpl': out_tmpl,
         'quiet': False,
         'no_warnings': True,
     }
-    
-    print(f"\n  📥  Downloading video from {url} ...")
+
+    if section_minutes is not None:
+        # Cap at first N minutes — avoids downloading 50+ GB 12-hour videos
+        h = int(section_minutes) // 60
+        m = int(section_minutes) % 60
+        end = f'{h:02d}:{m:02d}:00'
+        ydl_opts['download_ranges'] = yt_dlp.utils.download_range_func(
+            None, [{'start_time': 0, 'end_time': section_minutes * 60}]
+        )
+        ydl_opts['force_keyframes_at_cuts'] = True
+        print(f"\n  Downloading first {section_minutes} min of {url} ...")
+    else:
+        print(f"\n  Downloading {url} ...")
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        info     = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        # yt-dlp might change extension after merge
         if not os.path.exists(filename):
-             filename = os.path.splitext(filename)[0] + '.mp4'
-    
-    print(f"  ✅  Downloaded to: {filename}")
+            filename = os.path.splitext(filename)[0] + '.mp4'
+
+    size_mb = os.path.getsize(filename) / 1024**2 if os.path.exists(filename) else 0
+    print(f"  Downloaded: {filename}  ({size_mb:.0f} MB)")
     return filename
+
+def _youtube_search_urls(query: str, n: int = 5) -> list:
+    """
+    Returns up to n YouTube video URLs matching the search query,
+    without downloading anything.
+
+    Uses yt-dlp's ytsearch: prefix with extract_flat so no media is fetched.
+    Returns a list of full https://www.youtube.com/watch?v=... URLs.
+    """
+    import yt_dlp
+    urls = []
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'skip_download': True,
+    }
+    search_url = f"ytsearch{n}:{query}"
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            results = ydl.extract_info(search_url, download=False)
+            for entry in (results or {}).get('entries') or []:
+                if not entry:
+                    continue
+                vid_id = entry.get('id') or ''
+                if vid_id:
+                    urls.append(f"https://www.youtube.com/watch?v={vid_id}")
+        except Exception as e:
+            print(f"  [warn] Search error: {e}")
+    return urls
+
 
 def _download_external_image(url, output_dir=TEMP_FRAMES):
     """
@@ -508,35 +558,8 @@ def _collect_image_paths(image_data_dir=None):
 
 def _save_image_model(model):
     os.makedirs(MODELS_DIR, exist_ok=True)
-    torch.save(model.state_dict(), IMAGE_MODEL_PATH)
-    print(f"  💾  State-dict  → {IMAGE_MODEL_PATH}")
-
-    model.eval()
-    with torch.no_grad():
-        dummy_img  = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(device)
-        dummy_prnu = torch.zeros(1, PRNU_FULLRES_DIM).to(device)
-        try:
-            traced = torch.jit.trace(model, (dummy_img, dummy_prnu))
-            traced.save(IMAGE_MODEL_TS)
-            print(f"  💾  TorchScript → {IMAGE_MODEL_TS}")
-        except Exception as e:
-            print(f"  ⚠️  TorchScript export failed: {e}")
-    del dummy_img, dummy_prnu
-
-    # Dynamic quantisation (CPU only)
-    try:
-        m_cpu = EfficientFusionNet().cpu()
-        m_cpu.load_state_dict(torch.load(IMAGE_MODEL_PATH, map_location='cpu'))
-        m_cpu.eval()
-        quant = torch.quantization.quantize_dynamic(m_cpu, {nn.Linear}, dtype=torch.qint8)
-        torch.save(quant, IMAGE_MODEL_QUANT)
-        f_sz = os.path.getsize(IMAGE_MODEL_PATH)  / 1024**2
-        q_sz = os.path.getsize(IMAGE_MODEL_QUANT) / 1024**2
-        print(f"  💾  Quantised   → {IMAGE_MODEL_QUANT}  "
-              f"({f_sz:.1f} MB → {q_sz:.1f} MB, {f_sz/q_sz:.1f}× smaller)")
-        del m_cpu, quant
-    except Exception as e:
-        print(f"  ⚠️  Quantisation export failed (non-fatal): {e}")
+    torch.save({'model_state_dict': model.state_dict()}, UNIFIED_MODEL_PATH)
+    print(f"  💾  State-dict  → {UNIFIED_MODEL_PATH}")
 
 
 def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
@@ -550,7 +573,7 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
     print("\n")
     print("=" * 66)
     print("    SECTION A ─ IMAGE TRAINING")
-    print("    Model : EfficientFusionNet  (EfficientNet-B0 + PRNU 16-dim)")
+    print("    Model : UnifiedFusionNet v1  (16-branch, 64-dim PRNU, image mode)")
     print("=" * 66)
 
     # ── Data ──
@@ -588,7 +611,8 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
     print(f"\n  Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 
     # ── Model ──
-    model = EfficientFusionNet(prnu_in_features=PRNU_FULLRES_DIM).to(device)
+    model = UnifiedFusionNet(prnu_in_features=PRNU_FULLRES_DIM,
+                             gradient_checkpointing=True).to(device)
     model.param_summary()
 
     criterion = nn.BCEWithLogitsLoss()
@@ -825,7 +849,7 @@ class VideoDeepDataset(IterableDataset):
 
     Scans all videos in video_dir, extracts frames sequentially (no full
     pre-load), tiles each 4K frame, and yields:
-      (tile_img_tensor, flow_tile_tensor, prnu_tensor_16dim, label)
+      (tile_img_tensor, flow_tile_tensor, prnu_tensor_64dim, label)
 
     For each real frame, VID_EDITS_PER_FRAME AI-edited variants are generated
     and also yielded with label=1.
@@ -919,8 +943,6 @@ class VideoDeepDataset(IterableDataset):
 
         print(f"\n  📹  {vname}  [{w}×{h} @ {cam_fps:.0f}fps]  "
               f"sampling every {interval} frames ({self.fps_sample} fps)")
-
-        import librosa
 
         def _get_audio_chunk(f_idx, fps):
             if audio_y is None:
@@ -1113,22 +1135,8 @@ class VideoDeepDataset(IterableDataset):
 
 def _save_video_model(model, tile_size=VID_TILE_SIZE):
     os.makedirs(MODELS_DIR, exist_ok=True)
-    torch.save(model.state_dict(), VIDEO_MODEL_PATH)
-    print(f"  💾  State-dict  → {VIDEO_MODEL_PATH}")
-
-    model.eval()
-    with torch.no_grad():
-        d_img        = torch.randn(1, 3, tile_size, tile_size).to(device)
-        d_flow       = torch.zeros(1, 6, tile_size, tile_size).to(device)  # 6-channel
-        d_prnu       = torch.zeros(1, PRNU_FULLRES_DIM).to(device)
-        d_prnu_delta = torch.zeros(1, PRNU_FULLRES_DIM).to(device)
-        try:
-            traced = torch.jit.trace(model, (d_img, d_flow, d_prnu, d_prnu_delta))
-            traced.save(VIDEO_MODEL_TS)
-            print(f"  💾  TorchScript → {VIDEO_MODEL_TS}")
-        except Exception as e:
-            print(f"  ⚠️  TorchScript export failed: {e}")
-    del d_img, d_flow, d_prnu, d_prnu_delta
+    torch.save({'model_state_dict': model.state_dict()}, UNIFIED_MODEL_PATH)
+    print(f"  💾  State-dict  → {UNIFIED_MODEL_PATH}")
 
 
 def _save_checkpoint(model, optimizer, epoch, step, path=VIDEO_CKPT_PATH):
@@ -1148,14 +1156,25 @@ def _load_checkpoint(model, optimizer, path):
     if not os.path.exists(path):
         return 0, 0
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt['model_state'])
+    try:
+        missing, unexpected = model.load_state_dict(ckpt['model_state'], strict=False)
+        # If too many keys mismatch the checkpoint is from a different architecture
+        # — discard it and start fresh rather than training on broken weights.
+        total_keys = len(list(model.state_dict().keys()))
+        if len(missing) > total_keys * 0.3:
+            print(f"  [warn] Checkpoint architecture mismatch ({len(missing)} missing keys). "
+                  f"Starting from scratch.")
+            return 0, 0
+    except Exception as e:
+        print(f"  [warn] Could not load checkpoint: {e}. Starting from scratch.")
+        return 0, 0
     try:
         optimizer.load_state_dict(ckpt['optimizer_state'])
     except Exception:
         pass
     epoch = ckpt.get('epoch', 0)
     step  = ckpt.get('step', 0)
-    print(f"  ✅  Resumed from checkpoint (epoch {epoch}, step {step})")
+    print(f"  Resumed from checkpoint (epoch {epoch}, step {step})")
     return epoch, step
 
 
@@ -1180,7 +1199,7 @@ def train_video_section(
     print("\n")
     print("=" * 66)
     print("    SECTION B ─ VIDEO TRAINING  (4K · 120 FPS · Deep PRNU)")
-    print(f"    Model : VideoTemporalFusionNet  (Audio: {use_audio})")
+    print(f"    Model : UnifiedFusionNet v1  (16-branch, 64-dim PRNU, video mode)")
     print(f"    Dir   : {video_dir}")
     print(f"    Tile  : {tile_size}×{tile_size} px  |  "
           f"FPS sample: {fps_sample}  |  AI variants: {VID_EDITS_PER_FRAME}")
@@ -1204,7 +1223,8 @@ def train_video_section(
     )
 
     # ── Model ──
-    model = VideoTemporalFusionNet(use_audio=use_audio).to(device)
+    model = UnifiedFusionNet(prnu_in_features=PRNU_FULLRES_DIM,
+                             gradient_checkpointing=True).to(device)
     model.param_summary()
 
     criterion = nn.BCEWithLogitsLoss()
@@ -1229,7 +1249,8 @@ def train_video_section(
           f"(eff. batch = {batch_size}×{grad_accum} = {batch_size*grad_accum})\n")
 
     ckpt_interval_sec = checkpoint_interval_min * 60
-    live_plot = LivePlot(title='Video Training — VideoTemporalFusionNet', xlabel='Epoch')
+    live_plot = LivePlot(title='Video Training — UnifiedFusionNet v1', xlabel='Epoch')
+    dashboard = TrainingDashboard(title='AI Detector — Video Training (UnifiedFusionNet v1)')
 
     for epoch in range(start_epoch, epochs):
         ResourceGuard.check_or_abort(
@@ -1257,12 +1278,20 @@ def train_video_section(
             targets = targets.to(device).view(-1, 1)
 
             with torch.amp.autocast(device.type, enabled=use_amp):
-                out  = model(imgs, flows, prnu_feats, prnu_deltas, audio=audio_ts)
-                loss = criterion(out, targets) / grad_accum
+                out = model(imgs, prnu_feats, None, flows, prnu_deltas, mode="video")
+                if isinstance(out, tuple):
+                    logits = out[0]
+                    loss = criterion(logits, targets)
+                    for aux in out[1:]:
+                        loss = loss + 0.2 * criterion(aux, targets)
+                    loss = loss / grad_accum
+                else:
+                    logits = out
+                    loss = criterion(logits, targets) / grad_accum
 
             if torch.isnan(loss):
                 optimizer.zero_grad()
-                del imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets, out, loss
+                del imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets, out, logits, loss
                 continue
 
             scaler.scale(loss).backward()
@@ -1276,11 +1305,27 @@ def train_video_section(
                 optimizer.zero_grad()
 
             run_loss += loss.item() * grad_accum * imgs.size(0)
-            preds = (torch.sigmoid(out.detach()) > 0.5).float()
+            preds = (torch.sigmoid(logits.detach()) > 0.5).float()
             total   += targets.size(0)
             correct += (preds == targets).sum().item()
 
-            del imgs, flows, prnu_feats, prnu_deltas, targets, out, loss
+            # Dashboard — capture sample every 10 optimizer steps
+            if step % (grad_accum * 10) == 0:
+                try:
+                    _confs  = torch.sigmoid(logits.detach()[:, 0]).cpu().numpy()
+                    _labels = targets[:, 0].cpu().numpy()
+                    _img    = imgs[0].detach().cpu()
+                    _prnu   = prnu_feats[0].detach().cpu().numpy()
+                    dashboard.update_frame(_img, _prnu, _confs, _labels)
+                    dashboard.update_metrics(
+                        step,
+                        run_loss / max(total, 1),
+                        correct  / max(total, 1),
+                    )
+                except Exception:
+                    pass
+
+            del imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets, out, logits, loss
 
             # Progress every 10 optimizer steps
             if step % (grad_accum * 10) == 0 and total > 0:
@@ -1317,6 +1362,7 @@ def train_video_section(
               f"({elapsed/60:.1f} min | {total} tiles)")
 
         live_plot.update(epoch + 1, ep_loss, ep_acc)
+        dashboard.update_metrics(step, ep_loss, ep_acc)
 
         scheduler.step()
 
@@ -1329,6 +1375,7 @@ def train_video_section(
             torch.cuda.empty_cache()
 
     live_plot.close()
+    dashboard.close()
     print("\n  ✅  Video training complete.")
     _save_video_model(model, tile_size)
 
@@ -1396,17 +1443,59 @@ def interactive_main():
                 temp_video_path = None
                 
                 if choice_src == '2':
-                    print("\nEnter YouTube URLs (one per line, blank line when done):")
+                    print("\nYouTube mode:")
+                    print("  1) Enter specific video URLs")
+                    print("  2) Search by query (e.g. 'nature 4k footage', 'dashcam raw')")
+                    yt_mode = input("Choice [1/2]: ").strip()
+
                     youtube_urls = []
-                    while True:
-                        line = input(f"  URL {len(youtube_urls)+1} (or Enter to start): ").strip()
-                        if not line:
-                            break
-                        youtube_urls.append(line)
+
+                    if yt_mode == '2':
+                        print("\nEnter search queries, one per line.")
+                        print("  Optionally append a count: 'nature footage 4k 8'  (default: 5 per query)")
+                        print("  Blank line to start downloading.")
+                        raw_queries = []
+                        while True:
+                            line = input(f"  Query {len(raw_queries)+1}: ").strip()
+                            if not line:
+                                break
+                            raw_queries.append(line)
+                        if not raw_queries:
+                            print("  No queries entered.")
+                            continue
+                        for q in raw_queries:
+                            parts = q.rsplit(' ', 1)
+                            if len(parts) == 2 and parts[1].isdigit():
+                                query, n_per_query = parts[0], int(parts[1])
+                            else:
+                                query, n_per_query = q, 5
+                            print(f"\n  Searching YouTube: '{query}'  (up to {n_per_query} videos)...")
+                            found = _youtube_search_urls(query, n=n_per_query)
+                            print(f"  Found {len(found)} video(s)")
+                            youtube_urls.extend(found)
+                    else:
+                        print("\nEnter YouTube URLs (one per line, blank line when done):")
+                        while True:
+                            line = input(f"  URL {len(youtube_urls)+1} (or Enter to start): ").strip()
+                            if not line:
+                                break
+                            youtube_urls.append(line)
 
                     if not youtube_urls:
-                        print("  No URLs entered.")
+                        print("  No videos to process.")
                         continue
+
+                    # Section limit — important for long videos (e.g. 12-hour 4K)
+                    try:
+                        sec_input = input(
+                            "\n  Download limit per video in minutes "
+                            "(e.g. 20 for first 20 min, 0 = full video) "
+                            "[default: 20]: "
+                        ).strip()
+                        section_minutes = int(sec_input) if sec_input else 20
+                        section_minutes = None if section_minutes == 0 else section_minutes
+                    except ValueError:
+                        section_minutes = 20
 
                     # Collect AI video dir before starting the batch
                     default_ai_dir = os.path.join(DATA_DIR, 'ai_videos')
@@ -1433,7 +1522,9 @@ def interactive_main():
                         print(f"{'='*60}")
                         temp_video_path = None
                         try:
-                            temp_video_path = _download_youtube_video(yt_url)
+                            temp_video_path = _download_youtube_video(
+                                yt_url, section_minutes=section_minutes
+                            )
                         except Exception as exc:
                             print(f"  [ERROR] Download failed: {exc}. Skipping.")
                             continue
@@ -1564,7 +1655,52 @@ def interactive_main():
                  except: pass
 
 def main():
-    interactive_main()
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--youtube', nargs='+', metavar='URL',
+                        help='One or more YouTube URLs to train on directly')
+    parser.add_argument('--minutes', type=float, default=20,
+                        help='Minutes to download per video (0 = full, default 20)')
+    parser.add_argument('--epochs',  type=int,   default=VID_EPOCHS)
+    parser.add_argument('--fps',     type=float, default=VID_FPS_SAMPLE)
+    parser.add_argument('--variants',type=int,   default=VID_EDITS_PER_FRAME)
+    args, _ = parser.parse_known_args()
+
+    if args.youtube:
+        section_minutes = None if args.minutes == 0 else args.minutes
+        ai_video_dir    = os.path.join(DATA_DIR, 'ai_videos')
+        ai_video_dir    = ai_video_dir if os.path.isdir(ai_video_dir) else None
+
+        for idx, yt_url in enumerate(args.youtube, 1):
+            print(f"\n{'='*60}")
+            print(f"  VIDEO {idx}/{len(args.youtube)}: {yt_url}")
+            print(f"{'='*60}")
+            temp_path = None
+            try:
+                temp_path = _download_youtube_video(
+                    yt_url, section_minutes=section_minutes
+                )
+                train_video_section(
+                    video_dir               = TEMP_FRAMES,
+                    epochs                  = args.epochs,
+                    batch_size              = VID_BATCH,
+                    lr                      = VID_LR,
+                    tile_size               = VID_TILE_SIZE,
+                    fps_sample              = args.fps,
+                    checkpoint_interval_min = CKPT_INTERVAL_MIN,
+                    resume_path             = VIDEO_CKPT_PATH,
+                    use_audio               = False,
+                    ai_video_dir            = ai_video_dir,
+                )
+            except Exception as exc:
+                print(f"  [ERROR] {exc}")
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+                    print(f"  Deleted: {temp_path}")
+        print("\nDone.")
+    else:
+        interactive_main()
 
 if __name__ == '__main__':
     main()
