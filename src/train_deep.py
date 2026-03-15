@@ -100,10 +100,10 @@ VIDEO_MODEL_PATH    = os.path.join(MODELS_DIR, 'ai_detector_video_deep.pth')   #
 VIDEO_MODEL_TS      = os.path.join(MODELS_DIR, 'ai_detector_video_deep_script.ts')
 VIDEO_CKPT_PATH     = os.path.join(MODELS_DIR, 'ai_detector_video_deep_ckpt.pth')
 
-# Image training defaults
+# Image training defaults — tuned for T4 (14.6 GB VRAM)
 IMG_SIZE          = 512
-IMG_BATCH         = 4
-IMG_GRAD_ACCUM    = 8       # effective batch = 32
+IMG_BATCH         = 8       # T4 handles 8×512 with gradient_checkpointing=True
+IMG_GRAD_ACCUM    = 4       # effective batch = 32 (same as before, fewer accum steps needed)
 IMG_EPOCHS        = 10
 IMG_LR            = 1e-3
 
@@ -622,9 +622,9 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
     val_ds   = ImageDataset(X_val, y_val, transform=val_tf)
     num_workers = 0   # 0 = main process only (Colab-safe; avoids fork issues)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          num_workers=num_workers, pin_memory=(num_workers > 0))
+                          num_workers=num_workers, pin_memory=(device.type == 'cuda'))
     val_dl   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                          num_workers=num_workers, pin_memory=(num_workers > 0))
+                          num_workers=num_workers, pin_memory=(device.type == 'cuda'))
 
     print(f"\n  Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 

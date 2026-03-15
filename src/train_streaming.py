@@ -54,7 +54,7 @@ DATA_DIR    = os.path.join(SCRIPT_DIR, '..', 'data')
 MODELS_DIR  = os.path.join(SCRIPT_DIR, '..', 'models')
 
 sys.path.insert(0, SCRIPT_DIR)
-from model_prnu import DeepFusionNet, EfficientFusionNet
+from model_prnu import UnifiedFusionNet, DeepFusionNet, EfficientFusionNet
 from prnu_features import extract_prnu_features_fullres, extract_prnu_map
 from prnu_cuda import PRNUExtractorGPU
 from prnu_recovery import (
@@ -67,12 +67,12 @@ from live_plot import LivePlot
 # ═══════════════════════════════════════════════════════════════════════════
 
 PRNU_FEATURE_DIM  = 64      # 32 in v5; 64 in v6
-IMG_SIZE          = 384     # reduced from 640 — faster T4 training (~2.8x speedup)
+IMG_SIZE          = 512     # T4 (14.6 GB VRAM) can handle 512 with batch=8 comfortably
 BATCH_REAL        = 32
 BATCH_AI          = 32
 INNER_EPOCHS      = 1
 GRAD_ACCUM_STEPS  = 8
-LOADER_BATCH_SIZE = 8       # increased from 4 — better GPU utilization
+LOADER_BATCH_SIZE = 8       # effective batch = 64 on T4
 PRNU_TILE_SIZE    = 256     # reduced from 1024 — ~16x faster PRNU extraction
 
 LAMBDA_PRNU          = 0.35   # PRNU scalar features aux loss weight
@@ -82,6 +82,7 @@ LAMBDA_GAN_DIFF      = 0.25   # GAN/Diffusion fingerprint aux loss weight
 LAMBDA_CMOS          = 0.20   # CMOS/CCD sensor noise aux loss weight
 LAMBDA_COLOR_INCON   = 0.20   # Color channel inconsistency aux loss weight
 LAMBDA_FLOW          = 0.15   # Optical flow irregularity aux loss weight
+LAMBDA_MOTION        = 0.15   # MotionGRU temporal branch aux loss weight
 
 # Open Images metadata CSVs — primary (2018_04 with rotation data) + v7 fallback
 OI_VAL_CSV_URL   = ("https://storage.googleapis.com/openimages/2018_04/"
@@ -96,7 +97,8 @@ OI_TRAIN_CSV_URL_V7 = ("https://storage.googleapis.com/openimages/v7/"
                         "oidv7-image-ids-boxable.csv")
 
 PROGRESS_FILE      = os.path.join(MODELS_DIR, 'stream_progress.json')
-FUSION_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion_v5.pth')
+FUSION_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_unified_v1.pth')   # unified v1 (primary)
+FUSION_MODEL_LEGACY = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion_v5.pth')  # fallback
 CKPT_PATH          = os.path.join(MODELS_DIR, 'checkpoint_latest.pth')
 RECOVERY_PATH      = os.path.join(MODELS_DIR, 'prnu_recovery.pth')
 CACHE_DIR          = os.path.join(DATA_DIR, 'stream_cache')
@@ -788,34 +790,32 @@ def load_ai_image_paths() -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_or_init_model(device):
-    """Load existing DeepFusionNet v6 if available, else init fresh."""
-    model = DeepFusionNet(prnu_in_features=PRNU_FEATURE_DIM).to(device)
+    """Load existing UnifiedFusionNet v1 if available, else init fresh."""
+    model = UnifiedFusionNet(
+        prnu_in_features=PRNU_FEATURE_DIM,
+        gradient_checkpointing=True,   # saves ~300-600 MB VRAM during training
+    ).to(device)
 
-    if os.path.exists(FUSION_MODEL_PATH):
+    # Try each candidate in priority order
+    candidates = [FUSION_MODEL_PATH, CKPT_PATH, FUSION_MODEL_LEGACY]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
         try:
             try:
-                state = torch.load(FUSION_MODEL_PATH, map_location=device, weights_only=True)
+                raw = torch.load(path, map_location=device, weights_only=True)
             except Exception:
-                state = torch.load(FUSION_MODEL_PATH, map_location=device)
-            model.load_state_dict(state, strict=False)
-            print(f"  Loaded DeepFusionNet v6 weights from {FUSION_MODEL_PATH}")
+                raw = torch.load(path, map_location=device)
+            # Support both raw state-dict and {'model_state_dict': ...} formats
+            state = raw.get('model_state_dict', raw) if isinstance(raw, dict) else raw
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            print(f"  Loaded UnifiedFusionNet v1 from {path}  "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
             return model
         except Exception as e:
-            print(f"  Could not load {FUSION_MODEL_PATH}: {e}")
+            print(f"  Could not load {path}: {e}")
 
-    if os.path.exists(CKPT_PATH):
-        try:
-            try:
-                ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=True)
-            except Exception:
-                ckpt = torch.load(CKPT_PATH, map_location=device)
-            model.load_state_dict(ckpt['model_state_dict'], strict=False)
-            print(f"  Loaded DeepFusionNet v6 from checkpoint {CKPT_PATH}")
-            return model
-        except Exception as e:
-            print(f"  Could not load checkpoint {CKPT_PATH}: {e}")
-
-    print("  Initialising fresh DeepFusionNet v6 (no existing weights found)")
+    print("  Initialising fresh UnifiedFusionNet v1 (no existing weights found)")
     return model
 
 
@@ -858,7 +858,7 @@ def _save_checkpoint(model, optimizer, batches_done, loss, acc):
 
 def _save_model(model):
     os.makedirs(MODELS_DIR, exist_ok=True)
-    torch.save(model.state_dict(), FUSION_MODEL_PATH)
+    torch.save({'model_state_dict': model.state_dict()}, FUSION_MODEL_PATH)
     print(f"  Model saved → {FUSION_MODEL_PATH}")
 
 
@@ -936,8 +936,10 @@ def train_one_batch(model, optimizer, scaler, loader, device,
             with torch.amp.autocast(device.type, enabled=use_amp):
                 out = model(imgs, prnu, prnu_map)
                 if isinstance(out, tuple):
+                    # UnifiedFusionNet returns 9 outputs:
+                    # (logit, prnu, halluc, prnu_spatial, gan_diff, cmos, color_incon, flow, motion)
                     (logits, prnu_aux, halluc_aux, prnu_spatial_aux,
-                     gan_diff_aux, cmos_aux, color_incon_aux, flow_aux, *_rest) = out
+                     gan_diff_aux, cmos_aux, color_incon_aux, flow_aux, motion_aux) = out
                     loss = (
                         criterion(logits,           labels)
                         + LAMBDA_PRNU         * criterion(prnu_aux,         labels)
@@ -947,6 +949,7 @@ def train_one_batch(model, optimizer, scaler, loader, device,
                         + LAMBDA_CMOS         * criterion(cmos_aux,         labels)
                         + LAMBDA_COLOR_INCON  * criterion(color_incon_aux,  labels)
                         + LAMBDA_FLOW         * criterion(flow_aux,         labels)
+                        + LAMBDA_MOTION       * criterion(motion_aux,       labels)
                     ) / accum_steps
                 else:
                     logits = out
