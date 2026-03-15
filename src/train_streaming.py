@@ -539,10 +539,23 @@ def _download_metadata_csv(source: str) -> str:
 
 def load_url_list(source: str, url_file=None) -> list:
     if url_file:
+        if not os.path.exists(url_file):
+            raise FileNotFoundError(
+                f"URL file not found: '{url_file}'\n"
+                f"  Create it with one URL per line, or omit --url_file to stream from Open Images.\n"
+                f"  Example: python train_streaming.py --source val --total_batches 500"
+            )
         print(f"  Loading URLs from custom file: {url_file}")
         with open(url_file, encoding='utf-8') as f:
-            urls = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+            urls = [l.strip() for l in f
+                    if l.strip() and not l.startswith('#')
+                    and 'REAL_VIDEO_ID' not in l and 'AI_VIDEO_ID' not in l]
         print(f"  → {len(urls):,} URLs loaded")
+        if not urls:
+            raise ValueError(
+                f"No valid URLs found in '{url_file}' (all lines are comments or placeholders).\n"
+                f"  Add real URLs to the file or use --source val to stream from Open Images."
+            )
         return urls
 
     csv_path = _download_metadata_csv(source)
@@ -663,8 +676,17 @@ def _download_video_frames(url: str, dest_dir: str,
     try:
         import yt_dlp
     except ImportError:
-        print("  [warn] yt-dlp not installed — skipping video URL:", url)
-        return []
+        print("  [info] yt-dlp not installed — installing automatically...")
+        import subprocess
+        subprocess.check_call(
+            [sys.executable, '-m', 'pip', 'install', '-q', 'yt-dlp'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            import yt_dlp
+        except ImportError:
+            print("  [warn] yt-dlp install failed — skipping video URL:", url)
+            return []
 
     os.makedirs(dest_dir, exist_ok=True)
     tmp_video = os.path.join(dest_dir, f'{prefix}_video.mp4')
