@@ -82,11 +82,17 @@ LAMBDA_CMOS          = 0.20   # CMOS/CCD sensor noise aux loss weight
 LAMBDA_COLOR_INCON   = 0.20   # Color channel inconsistency aux loss weight
 LAMBDA_FLOW          = 0.15   # Optical flow irregularity aux loss weight
 
-# Open Images metadata CSVs (GCS public bucket)
+# Open Images metadata CSVs — primary (2018_04 with rotation data) + v7 fallback
 OI_VAL_CSV_URL   = ("https://storage.googleapis.com/openimages/2018_04/"
                     "validation/validation-images-with-rotation.csv")
 OI_TRAIN_CSV_URL = ("https://storage.googleapis.com/openimages/2018_04/"
                     "train/train-images-boxable-with-rotation.csv")
+
+# Fallback URLs (Open Images v7 — no rotation data but more stable)
+OI_VAL_CSV_URL_V7   = ("https://storage.googleapis.com/openimages/v7/"
+                        "oidv7-image-ids-boxable-validation.csv")
+OI_TRAIN_CSV_URL_V7 = ("https://storage.googleapis.com/openimages/v7/"
+                        "oidv7-image-ids-boxable.csv")
 
 PROGRESS_FILE      = os.path.join(MODELS_DIR, 'stream_progress.json')
 FUSION_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion_v5.pth')
@@ -456,30 +462,32 @@ class StreamBatchDataset(Dataset):
             except Exception:
                 pass
 
-        # Extract 64-dim PRNU features (CPU path)
-        # Real: no compression damage → no recovery_net needed
-        # AI:   compressed → pass recovery_net to undo compression artefacts
-        try:
-            prnu = extract_prnu_features_fullres(
-                img,
-                recovery_net=self.recovery_net if label == 1 else None,
-                device=self.device,
-            )
-            if not np.isfinite(prnu).all():
+        # If GPU extractor is available, defer PRNU to the training loop
+        # (DataLoader workers can't share GPU memory; return zeros as placeholder)
+        if self.prnu_extractor is not None:
+            prnu       = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
+            prnu_map_t = torch.zeros(3, 128, 128, dtype=torch.float32)
+        else:
+            # CPU path — used when no GPU extractor is wired
+            try:
+                prnu = extract_prnu_features_fullres(
+                    img,
+                    recovery_net=self.recovery_net if label == 1 else None,
+                    device=self.device,
+                )
+                if not np.isfinite(prnu).all():
+                    prnu = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
+            except Exception:
                 prnu = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
-        except Exception:
-            prnu = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
 
-        # Extract 128×128 PRNU spatial map (CPU)
-        try:
-            prnu_map_np = extract_prnu_map(img, output_size=128)  # (128,128,3) float32
-            if not np.isfinite(prnu_map_np).all():
+            try:
+                prnu_map_np = extract_prnu_map(img, output_size=128)
+                if not np.isfinite(prnu_map_np).all():
+                    prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
+            except Exception:
                 prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
-        except Exception:
-            prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
 
-        # (128,128,3) → (3,128,128) tensor
-        prnu_map_t = torch.from_numpy(prnu_map_np.transpose(2, 0, 1)).float()
+            prnu_map_t = torch.from_numpy(prnu_map_np.transpose(2, 0, 1)).float()
 
         # Visual transform for CNN input — asymmetric by label
         transform = self.ai_transform if label == 1 else self.real_transform
@@ -507,24 +515,30 @@ def _download_metadata_csv(source: str) -> str:
         print(f"  Metadata CSV already cached: {cache_path}")
         return cache_path
 
-    url = OI_TRAIN_CSV_URL if source == 'train' else OI_VAL_CSV_URL
-    print(f"  Downloading Open Images {source} metadata CSV ...")
+    primary  = OI_TRAIN_CSV_URL   if source == 'train' else OI_VAL_CSV_URL
+    fallback = OI_TRAIN_CSV_URL_V7 if source == 'train' else OI_VAL_CSV_URL_V7
     tmp_path = cache_path + '.tmp'
-    try:
-        urllib.request.urlretrieve(url, tmp_path)
-        os.replace(tmp_path, cache_path)
-        print(f"  Downloaded {os.path.getsize(cache_path)/1024**2:.1f} MB → {cache_path}")
-    except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise RuntimeError(f"Failed to download OI metadata CSV: {e}")
+    for label, url in [('2018_04', primary), ('v7 fallback', fallback)]:
+        print(f"  Downloading Open Images {source} metadata CSV ({label}) ...")
+        try:
+            urllib.request.urlretrieve(url, tmp_path)
+            os.replace(tmp_path, cache_path)
+            print(f"  Downloaded {os.path.getsize(cache_path)/1024**2:.1f} MB → {cache_path}")
+            break
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except Exception: pass
+            print(f"  [warn] {label} CSV failed ({e}), trying fallback ...")
+    else:
+        raise RuntimeError("Failed to download Open Images metadata CSV (both URLs failed)")
     return cache_path
 
 
 def load_url_list(source: str, url_file=None) -> list:
     if url_file:
         print(f"  Loading URLs from custom file: {url_file}")
-        with open(url_file) as f:
+        with open(url_file, encoding='utf-8') as f:
             urls = [l.strip() for l in f if l.strip() and not l.startswith('#')]
         print(f"  → {len(urls):,} URLs loaded")
         return urls
@@ -573,19 +587,163 @@ def _download_image(url: str, dest_path: str, timeout: int = 20):
 
 def download_batch(urls: list, dest_dir: str, max_workers: int = 8) -> list:
     os.makedirs(dest_dir, exist_ok=True)
-    futures = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for i, url in enumerate(urls):
-            ext  = os.path.splitext(url.split('?')[0])[-1].lower()
-            ext  = ext if ext in _IMG_EXTS else '.jpg'
-            dest = os.path.join(dest_dir, f'img_{i:05d}{ext}')
-            futures[pool.submit(_download_image, url, dest)] = dest
-        ok = []
-        for fut in as_completed(futures):
-            path, success = fut.result()
-            if success:
-                ok.append(path)
+
+    # Split: video URLs (YouTube/Vimeo/etc.) vs direct image URLs
+    video_urls = [u for u in urls if _is_video_url(u)]
+    image_urls = [u for u in urls if not _is_video_url(u)]
+
+    ok = []
+
+    # Download direct image URLs in parallel
+    if image_urls:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for i, url in enumerate(image_urls):
+                ext  = os.path.splitext(url.split('?')[0])[-1].lower()
+                ext  = ext if ext in _IMG_EXTS else '.jpg'
+                dest = os.path.join(dest_dir, f'img_{i:05d}{ext}')
+                futures[pool.submit(_download_image, url, dest)] = dest
+            for fut in as_completed(futures):
+                path, success = fut.result()
+                if success:
+                    ok.append(path)
+
+    # Download video URLs with yt-dlp and extract frames
+    for i, url in enumerate(video_urls):
+        frames = _download_video_frames(url, dest_dir,
+                                        prefix=f'vid_{i:03d}',
+                                        max_frames=32)
+        ok.extend(frames)
+
     return ok
+
+
+# ─── Video URL helpers ────────────────────────────────────────────────────────
+
+_VIDEO_URL_PATTERNS = (
+    'youtube.com/watch', 'youtu.be/', 'youtube.com/shorts/',
+    'youtube.com/playlist', 'youtube.com/channel', 'youtube.com/@',
+    'vimeo.com/', 'dailymotion.com/', 'twitch.tv/', 'rumble.com/',
+    'tiktok.com/', 'instagram.com/reel', 'instagram.com/p/',
+    'twitter.com/', 'x.com/', 'reddit.com/r/',
+)
+
+_VIDEO_URL_EXTS = ('.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.flv')
+
+
+def _is_video_url(url: str) -> bool:
+    """Return True if `url` points to a video platform or direct video file."""
+    u = url.lower()
+    if any(p in u for p in _VIDEO_URL_PATTERNS):
+        return True
+    ext = os.path.splitext(u.split('?')[0])[-1]
+    return ext in _VIDEO_URL_EXTS
+
+
+def _download_video_frames(url: str, dest_dir: str,
+                            prefix: str = 'vid',
+                            max_frames: int = 32,
+                            fps_cap: float = 1.0) -> list:
+    """
+    Download a video from any yt-dlp-supported URL and extract up to
+    `max_frames` evenly-spaced frames as JPEG images.
+
+    Args:
+        url        : any URL supported by yt-dlp (YouTube, Vimeo, TikTok, …)
+        dest_dir   : directory to save extracted frames
+        prefix     : filename prefix for saved frames
+        max_frames : max frames to extract per video
+        fps_cap    : extract at most this many frames per second of video
+
+    Returns:
+        list of saved frame paths
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        print("  [warn] yt-dlp not installed — skipping video URL:", url)
+        return []
+
+    os.makedirs(dest_dir, exist_ok=True)
+    tmp_video = os.path.join(dest_dir, f'{prefix}_video.mp4')
+
+    # ── 1. Download video with yt-dlp ────────────────────────────────────
+    ydl_opts = {
+        # Prefer H.264 (avc1) so OpenCV cv2 can decode without hardware AV1 support.
+        # Falls back to any non-AV1 mp4, then any mp4, then best available.
+        'format': (
+            'bestvideo[vcodec^=avc1][ext=mp4][height<=720]+bestaudio[ext=m4a]'
+            '/bestvideo[ext=mp4][height<=720][vcodec!^=av01]+bestaudio[ext=m4a]'
+            '/best[ext=mp4][height<=720]'
+            '/best'
+        ),
+        'outtmpl': tmp_video,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,        # single video only (use --url_file for playlists)
+        'socket_timeout': 30,
+        'retries': 3,
+        'merge_output_format': 'mp4',
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            duration = info.get('duration', 60)   # seconds
+    except Exception as e:
+        print(f"  [warn] yt-dlp failed for {url}: {e}")
+        if os.path.exists(tmp_video):
+            try: os.remove(tmp_video)
+            except Exception: pass
+        return []
+
+    # If yt-dlp appended an extension, find the actual file
+    if not os.path.exists(tmp_video):
+        candidates = [
+            f for f in os.listdir(dest_dir)
+            if f.startswith(prefix) and f.endswith(('.mp4', '.mkv', '.webm'))
+        ]
+        if candidates:
+            tmp_video = os.path.join(dest_dir, candidates[0])
+        else:
+            print(f"  [warn] Video file not found after download: {url}")
+            return []
+
+    # ── 2. Extract frames evenly spaced across the video ─────────────────
+    frames = []
+    try:
+        import cv2
+        cap = cv2.VideoCapture(tmp_video)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_fps    = cap.get(cv2.CAP_PROP_FPS) or 25.0
+
+        if total_frames <= 0:
+            cap.release()
+            raise ValueError("Cannot read frame count")
+
+        # Determine which frame indices to extract
+        n_extract = min(max_frames, max(1, int(duration * fps_cap)))
+        indices   = [int(total_frames * i / n_extract) for i in range(n_extract)]
+
+        for fi, idx in enumerate(indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+            out_path = os.path.join(dest_dir, f'{prefix}_f{fi:04d}.jpg')
+            img.save(out_path, 'JPEG', quality=92)
+            frames.append(out_path)
+
+        cap.release()
+    except Exception as e:
+        print(f"  [warn] Frame extraction failed for {url}: {e}")
+    finally:
+        try: os.remove(tmp_video)
+        except Exception: pass
+
+    print(f"  [video] {url[:60]}… → {len(frames)} frames")
+    return frames
 
 
 def load_ai_image_paths() -> list:
@@ -611,7 +769,10 @@ def load_or_init_model(device):
 
     if os.path.exists(FUSION_MODEL_PATH):
         try:
-            state = torch.load(FUSION_MODEL_PATH, map_location=device)
+            try:
+                state = torch.load(FUSION_MODEL_PATH, map_location=device, weights_only=True)
+            except Exception:
+                state = torch.load(FUSION_MODEL_PATH, map_location=device)
             model.load_state_dict(state, strict=False)
             print(f"  Loaded DeepFusionNet v6 weights from {FUSION_MODEL_PATH}")
             return model
@@ -620,7 +781,10 @@ def load_or_init_model(device):
 
     if os.path.exists(CKPT_PATH):
         try:
-            ckpt = torch.load(CKPT_PATH, map_location=device)
+            try:
+                ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=True)
+            except Exception:
+                ckpt = torch.load(CKPT_PATH, map_location=device)
             model.load_state_dict(ckpt['model_state_dict'], strict=False)
             print(f"  Loaded DeepFusionNet v6 from checkpoint {CKPT_PATH}")
             return model
@@ -698,7 +862,8 @@ def _vram_str(device) -> str:
 
 
 def train_one_batch(model, optimizer, scaler, loader, device,
-                    accum_steps=GRAD_ACCUM_STEPS, desc='Train') -> tuple:
+                    accum_steps=GRAD_ACCUM_STEPS, desc='Train',
+                    prnu_gpu=None) -> tuple:
     """
     Run one pass through `loader` with AMP + gradient accumulation.
     Shows a tqdm progress bar with live loss / accuracy / VRAM.
@@ -728,24 +893,47 @@ def train_one_batch(model, optimizer, scaler, loader, device,
         prnu_map = prnu_map.to(device, non_blocking=True)
         labels   = labels.to(device, non_blocking=True).view(-1, 1)
 
-        with torch.amp.autocast(device.type, enabled=use_amp):
-            out = model(imgs, prnu, prnu_map)
-            if isinstance(out, tuple):
-                (logits, prnu_aux, halluc_aux, prnu_spatial_aux,
-                 gan_diff_aux, cmos_aux, color_incon_aux, flow_aux) = out
-                loss = (
-                    criterion(logits,           labels)
-                    + LAMBDA_PRNU         * criterion(prnu_aux,         labels)
-                    + LAMBDA_HALLUC       * criterion(halluc_aux,       labels)
-                    + LAMBDA_PRNU_SPATIAL * criterion(prnu_spatial_aux, labels)
-                    + LAMBDA_GAN_DIFF     * criterion(gan_diff_aux,     labels)
-                    + LAMBDA_CMOS         * criterion(cmos_aux,         labels)
-                    + LAMBDA_COLOR_INCON  * criterion(color_incon_aux,  labels)
-                    + LAMBDA_FLOW         * criterion(flow_aux,         labels)
-                ) / accum_steps
-            else:
-                logits = out
-                loss   = criterion(logits, labels) / accum_steps
+        # GPU PRNU extraction — replaces placeholder zeros from DataLoader workers
+        if prnu_gpu is not None:
+            try:
+                with torch.no_grad():
+                    # imgs is ImageNet-normalised; de-normalise to [0,1] for PRNU
+                    _mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
+                    _std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
+                    imgs_01 = (imgs * _std + _mean).clamp(0, 1)
+                    prnu, prnu_map = prnu_gpu.extract_both(imgs_01)
+            except Exception as _pe:
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "[train_streaming] GPU PRNU extraction failed at batch %d (%s: %s)"
+                    " — using zero placeholders for this batch", i + 1, type(_pe).__name__, _pe)
+
+        try:
+            with torch.amp.autocast(device.type, enabled=use_amp):
+                out = model(imgs, prnu, prnu_map)
+                if isinstance(out, tuple):
+                    (logits, prnu_aux, halluc_aux, prnu_spatial_aux,
+                     gan_diff_aux, cmos_aux, color_incon_aux, flow_aux, *_rest) = out
+                    loss = (
+                        criterion(logits,           labels)
+                        + LAMBDA_PRNU         * criterion(prnu_aux,         labels)
+                        + LAMBDA_HALLUC       * criterion(halluc_aux,       labels)
+                        + LAMBDA_PRNU_SPATIAL * criterion(prnu_spatial_aux, labels)
+                        + LAMBDA_GAN_DIFF     * criterion(gan_diff_aux,     labels)
+                        + LAMBDA_CMOS         * criterion(cmos_aux,         labels)
+                        + LAMBDA_COLOR_INCON  * criterion(color_incon_aux,  labels)
+                        + LAMBDA_FLOW         * criterion(flow_aux,         labels)
+                    ) / accum_steps
+                else:
+                    logits = out
+                    loss   = criterion(logits, labels) / accum_steps
+        except Exception as _fwd_exc:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "[train_streaming] forward failed at batch %d (%s: %s) — skipping",
+                i + 1, type(_fwd_exc).__name__, _fwd_exc)
+            optimizer.zero_grad()
+            continue
 
         if torch.isnan(loss):
             optimizer.zero_grad()
@@ -789,7 +977,7 @@ def train_one_batch(model, optimizer, scaler, loader, device,
     return avg_loss, accuracy
 
 
-def eval_one_batch(model, loader, device) -> tuple:
+def eval_one_batch(model, loader, device, prnu_gpu=None) -> tuple:
     """Evaluate on the validation loader. Returns (avg_loss, accuracy)."""
     try:
         from tqdm import tqdm
@@ -807,15 +995,36 @@ def eval_one_batch(model, loader, device) -> tuple:
     total        = 0
 
     with torch.no_grad():
-        for imgs, prnu, labels in bar:
-            imgs   = imgs.to(device, non_blocking=True)
-            prnu   = prnu.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True).view(-1, 1)
+        for imgs, prnu, prnu_map, labels in bar:
+            imgs     = imgs.to(device, non_blocking=True)
+            prnu     = prnu.to(device, non_blocking=True)
+            prnu_map = prnu_map.to(device, non_blocking=True)
+            labels   = labels.to(device, non_blocking=True).view(-1, 1)
 
-            with torch.amp.autocast(device.type, enabled=use_amp):
-                out    = model(imgs, prnu)
-                logits = out[0] if isinstance(out, tuple) else out
-                loss   = criterion(logits, labels)
+            # GPU PRNU extraction for val batch
+            if prnu_gpu is not None:
+                try:
+                    _mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
+                    _std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
+                    imgs_01 = (imgs * _std + _mean).clamp(0, 1)
+                    prnu, prnu_map = prnu_gpu.extract_both(imgs_01)
+                except Exception as _pe:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        "[eval_streaming] GPU PRNU extraction failed (%s: %s)"
+                        " — using zero placeholders", type(_pe).__name__, _pe)
+
+            try:
+                with torch.amp.autocast(device.type, enabled=use_amp):
+                    out    = model(imgs, prnu, prnu_map)
+                    logits = out[0] if isinstance(out, tuple) else out
+                    loss   = criterion(logits, labels)
+            except Exception as _val_exc:
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "[eval_streaming] val forward failed (%s: %s) — skipping batch",
+                    type(_val_exc).__name__, _val_exc)
+                continue
 
             running_loss += loss.item() * imgs.size(0)
             preds   = (torch.sigmoid(logits) > 0.5).float()
@@ -841,7 +1050,13 @@ def main():
         description="Streaming Download-Train-Delete Trainer for DeepFusionNet v5"
     )
     parser.add_argument('--source', choices=['val', 'train'], default='val')
-    parser.add_argument('--url_file', type=str, default=None)
+    parser.add_argument('--url_file', type=str, default=None,
+                        help='Text file with one URL per line. Supports direct image URLs, '
+                             'YouTube links, playlists, Vimeo, TikTok, and any yt-dlp source. '
+                             'Lines starting with # are comments.')
+    parser.add_argument('--ai_url_file', type=str, default=None,
+                        help='Same format as --url_file but treated as AI-generated content (label=1). '
+                             'Use for YouTube channels of AI art, Midjourney showcases, etc.')
     parser.add_argument('--batch_real',   type=int, default=BATCH_REAL)
     parser.add_argument('--batch_ai',     type=int, default=BATCH_AI)
     parser.add_argument('--inner_epochs', type=int, default=INNER_EPOCHS)
@@ -857,6 +1072,13 @@ def main():
     parser.add_argument('--no_recovery',  action='store_true',
                         help='Disable PRNU recovery net (faster, less accurate)')
     args = parser.parse_args()
+
+    # Colab/Jupyter guard: forked workers cause CUDA context errors in notebooks
+    if args.num_workers > 0 and (
+        'google.colab' in sys.modules or 'ipykernel' in sys.modules
+    ):
+        print("  [Colab/Jupyter detected] Overriding --num_workers to 0")
+        args.num_workers = 0
 
     print("\n=== Streaming Trainer — DeepFusionNet v5 ===\n")
 
@@ -890,6 +1112,18 @@ def main():
     print("\n[2/5] Scanning local AI image pool ...")
     ai_paths = load_ai_image_paths()
 
+    # Pre-download AI frames from --ai_url_file (YouTube/video/image URLs)
+    if args.ai_url_file:
+        print(f"  Loading AI URLs from: {args.ai_url_file}")
+        with open(args.ai_url_file, encoding='utf-8') as f:
+            ai_urls = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+        print(f"  → {len(ai_urls)} AI URLs. Downloading frames...")
+        ai_dl_dir = os.path.join(DATA_DIR, 'ai_url_frames')
+        os.makedirs(ai_dl_dir, exist_ok=True)
+        downloaded = download_batch(ai_urls, ai_dl_dir, max_workers=args.max_workers)
+        ai_paths.extend(downloaded)
+        print(f"  → {len(downloaded)} AI frames downloaded → total AI pool: {len(ai_paths)}")
+
     # ── Load / init model ─────────────────────────────────────────────────
     print("\n[3/5] Loading main model ...")
     model = load_or_init_model(device)
@@ -898,6 +1132,19 @@ def main():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
     scaler    = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    # ── GPU PRNU extractor (CuPy-backed, replaces slow CPU path) ──────────
+    prnu_gpu = None
+    if device.type == 'cuda':
+        try:
+            prnu_gpu = PRNUExtractorGPU(device, map_size=128)
+            prnu_gpu.eval()
+            print("  PRNUExtractorGPU: enabled (GPU PRNU extraction active)")
+        except Exception as _e:
+            print(f"  PRNUExtractorGPU: failed to init ({_e}) — falling back to CPU")
+            prnu_gpu = None
+    else:
+        print("  PRNUExtractorGPU: skipped (CPU device)")
 
     # ── Load / init PRNU recovery net ─────────────────────────────────────
     print("\n[4/5] Loading PRNU recovery net ...")
@@ -1018,12 +1265,14 @@ def main():
                 real_transform=real_transform,
                 ai_transform=ai_transform,
                 recovery_net=recovery_net, device=device,
+                prnu_extractor=prnu_gpu,
             )
             val_dataset = StreamBatchDataset(
                 val_real, val_ai,
                 real_transform=val_transform,
                 ai_transform=val_transform,
                 recovery_net=recovery_net, device=device,
+                prnu_extractor=prnu_gpu,
             )
             train_loader = DataLoader(
                 train_dataset, batch_size=LOADER_BATCH_SIZE,
@@ -1044,7 +1293,8 @@ def main():
                     ep_str = f"ep {ep+1}/{args.inner_epochs}" if args.inner_epochs > 1 else ""
                     desc   = f"Train {ep_str}".strip()
                     avg_loss, acc = train_one_batch(
-                        model, optimizer, scaler, train_loader, device, desc=desc
+                        model, optimizer, scaler, train_loader, device,
+                        desc=desc, prnu_gpu=prnu_gpu,
                     )
                     print(f"  {'Train' + (' ' + ep_str if ep_str else ''):12s}"
                           f"loss={avg_loss:.4f}  acc={acc*100:.1f}%"
@@ -1052,7 +1302,7 @@ def main():
 
                 # ── Validate ───────────────────────────────────────────
                 if len(val_dataset) > 0:
-                    val_loss, val_acc = eval_one_batch(model, val_loader, device)
+                    val_loss, val_acc = eval_one_batch(model, val_loader, device, prnu_gpu=prnu_gpu)
                     print(f"  {'Val':12s}loss={val_loss:.4f}  acc={val_acc*100:.1f}%")
 
                     val_loss_history.append(val_loss)
@@ -1113,6 +1363,11 @@ def main():
             })
 
             _save_checkpoint(model, optimizer, batches_done, avg_loss, acc)
+
+            # Free GPU memory between batches — critical for long Colab runs
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
 
             if batches_done % args.save_every == 0:
                 _save_model(model)

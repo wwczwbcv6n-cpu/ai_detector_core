@@ -6,7 +6,12 @@ import shutil
 import sys
 import numpy as np
 import cv2
-import pyheif
+try:
+    import pyheif
+    _PYHEIF_AVAILABLE = True
+except ImportError:
+    pyheif = None
+    _PYHEIF_AVAILABLE = False
 from PIL import Image
 
 import torch
@@ -19,7 +24,7 @@ from sklearn.model_selection import train_test_split
 
 # Dual-branch model (v2: EfficientNet-B0 backbone) and PRNU feature extractor
 from model_prnu import DeepFusionNet, EfficientFusionNet, PRNUFusionNet
-from prnu_features import extract_prnu_features_fullres
+from prnu_features import extract_prnu_features_fullres, extract_prnu_map
 from live_plot import LivePlot
 
 # --- Configuration ---
@@ -29,7 +34,7 @@ BATCH_SIZE = 4              # EfficientNet-B0 at 512px fits at batch=4 on 4 GB G
 GRAD_ACCUM_STEPS = 8        # Effective batch = 4 × 8 = 32
 FRAMES_PER_VIDEO = 5        # Number of frames to extract from each video
 EPOCHS = 10
-PRNU_FEATURE_DIM = 32       # 32-dim fullres PRNU (v3)
+PRNU_FEATURE_DIM = 64       # 64-dim fullres PRNU (v6)
 AUX_LOSS_WEIGHT  = 0.15     # weight for each auxiliary head loss
 
 # Get the absolute path of the script's directory
@@ -178,6 +183,9 @@ def load_heic(path):
     """
     Loads a HEIC image using pyheif and converts it to a PIL Image.
     """
+    if not _PYHEIF_AVAILABLE:
+        print(f"pyheif not installed — cannot load HEIC: {path}")
+        return None
     try:
         heif_file = pyheif.read(path)
         # Assuming there's at least one image in the HEIC file
@@ -240,11 +248,11 @@ def extract_frames_from_video(video_path, num_frames=FRAMES_PER_VIDEO):
 
 class AIDetectorDataset(Dataset):
     """
-    Dataset that returns (image_tensor, prnu_features, label).
+    Dataset that returns (image_tensor, prnu_features, prnu_map, label).
 
-    `prnu_features` is an 8-dim float32 vector extracted from the image
-    by prnu_features.extract_prnu_features().  The PRNUFusionNet model
-    consumes both the image tensor and the PRNU features during training.
+    `prnu_features` is a 64-dim float32 vector (v6 fullres PRNU).
+    `prnu_map` is a (3, 128, 128) spatial PRNU noise map tensor.
+    DeepFusionNet v6 consumes all three inputs during training.
     """
     def __init__(self, image_paths, labels, transform=None):
         self.image_paths = image_paths
@@ -271,21 +279,30 @@ class AIDetectorDataset(Dataset):
                 print(f"  Warning: could not load {img_path}: {e} — using blank frame")
                 image = Image.new('RGB', (IMG_WIDTH, IMG_HEIGHT), color='black')
 
-        # --- Extract PRNU features (16-dim fullres) ---
+        # --- Extract PRNU features (64-dim fullres v6) ---
         try:
-            prnu_feats = extract_prnu_features_fullres(image)   # (16,)
+            prnu_feats = extract_prnu_features_fullres(image)   # (64,)
             if not np.isfinite(prnu_feats).all():
                 prnu_feats = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
         except Exception as e:
             print(f"  PRNU feature extraction failed for {img_path}: {e}")
             prnu_feats = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
 
+        # --- Extract PRNU spatial map (3×128×128) ---
+        try:
+            prnu_map_np = extract_prnu_map(image, output_size=128)   # (128,128,3)
+            if not np.isfinite(prnu_map_np).all():
+                prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
+        except Exception:
+            prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
+        prnu_map_t = torch.from_numpy(prnu_map_np.transpose(2, 0, 1)).float()  # (3,128,128)
+
         # --- Apply image transform (resize, normalize, augment) ---
         if self.transform:
             image = self.transform(image)
 
         prnu_tensor = torch.from_numpy(prnu_feats).float()
-        return image, prnu_tensor, torch.tensor(label, dtype=torch.float32)
+        return image, prnu_tensor, prnu_map_t, torch.tensor(label, dtype=torch.float32)
 
 def collect_data_paths(previously_trained_paths, image_data_dir=None):
     """
@@ -589,13 +606,16 @@ def train_pytorch_model(image_data_dir=None, use_prnu=True,
 
     # Mixed precision for GPU — halves VRAM usage
     use_amp = (device.type == 'cuda')
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     # ── Resume from checkpoint if requested ──────────────────────────────
     start_epoch = 0
     if resume_path and os.path.exists(resume_path):
         print(f"\nResuming from checkpoint: {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device)
+        try:
+            ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        except Exception:
+            ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt.get('epoch', 0)
@@ -616,32 +636,38 @@ def train_pytorch_model(image_data_dir=None, use_prnu=True,
         total_samples = 0
         optimizer.zero_grad()
 
-        for i, (inputs, prnu_feats, targets) in enumerate(train_loader):
+        for i, (inputs, prnu_feats, prnu_maps, targets) in enumerate(train_loader):
             inputs     = inputs.to(device)
             prnu_feats = prnu_feats.to(device)
+            prnu_maps  = prnu_maps.to(device)
             targets    = targets.to(device).view(-1, 1)
 
-            # Forward pass with AMP — dual-branch input
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                outputs = model(inputs, prnu_feats)   # DeepFusionNet v6
+            # Forward pass with AMP — triple-branch input
+            try:
+                with torch.amp.autocast(device.type, enabled=use_amp):
+                    outputs = model(inputs, prnu_feats, prnu_maps)   # DeepFusionNet v6
 
-                # Unpack: train mode returns (logit, *aux_logits)
-                if isinstance(outputs, tuple):
-                    logit      = outputs[0]            # (B, 1)
-                    aux_logits = outputs[1:]           # 7 aux logit tensors
-                else:
-                    logit      = outputs
-                    aux_logits = []
+                    # Unpack: train mode returns (logit, *aux_logits)
+                    if isinstance(outputs, tuple):
+                        logit      = outputs[0]            # (B, 1)
+                        aux_logits = outputs[1:]           # 7 aux logit tensors
+                    else:
+                        logit      = outputs
+                        aux_logits = []
 
-                # Primary loss
-                primary_loss = criterion(logit, targets)
+                    # Primary loss
+                    primary_loss = criterion(logit, targets)
 
-                # Auxiliary losses (each aux head also predicts binary AI/real)
-                aux_loss = sum(
-                    criterion(a, targets) for a in aux_logits
-                ) * AUX_LOSS_WEIGHT if aux_logits else torch.tensor(0.0, device=device)
+                    # Auxiliary losses (each aux head also predicts binary AI/real)
+                    aux_loss = sum(
+                        criterion(a, targets) for a in aux_logits
+                    ) * AUX_LOSS_WEIGHT if aux_logits else torch.tensor(0.0, device=device)
 
-                loss = (primary_loss + aux_loss) / GRAD_ACCUM_STEPS
+                    loss = (primary_loss + aux_loss) / GRAD_ACCUM_STEPS
+            except Exception as _fwd_exc:
+                print(f"  ⚠️  WARNING: forward pass failed at batch {i+1} ({type(_fwd_exc).__name__}: {_fwd_exc}). Skipping batch.")
+                optimizer.zero_grad()
+                continue
 
             # Check for NaN loss
             if torch.isnan(loss):
@@ -673,7 +699,7 @@ def train_pytorch_model(image_data_dir=None, use_prnu=True,
                 print(f"    Batch {i+1}/{len(train_loader)} | Loss: {running_loss / (total_samples if total_samples > 0 else 1):.4f} | Acc: {correct_predictions / (total_samples if total_samples > 0 else 1):.4f}")
 
             # Free GPU tensors immediately
-            del inputs, prnu_feats, targets, outputs, loss, logit, aux_logits
+            del inputs, prnu_feats, prnu_maps, targets, outputs, loss, logit, aux_logits
 
             # ── Safety check every 50 batches ──
             if (i + 1) % 50 == 0:
@@ -699,15 +725,20 @@ def train_pytorch_model(image_data_dir=None, use_prnu=True,
         val_correct_predictions = 0
         val_total_samples = 0
         with torch.no_grad():
-            for inputs, prnu_feats, targets in val_loader:
+            for inputs, prnu_feats, prnu_maps, targets in val_loader:
                 inputs     = inputs.to(device)
                 prnu_feats = prnu_feats.to(device)
+                prnu_maps  = prnu_maps.to(device)
                 targets    = targets.to(device).view(-1, 1)
 
-                outputs = model(inputs, prnu_feats)   # dual-branch
-                # Unpack eval output (always just logit in eval mode)
-                logit = outputs[0] if isinstance(outputs, tuple) else outputs
-                loss = criterion(logit, targets)
+                try:
+                    outputs = model(inputs, prnu_feats, prnu_maps)   # triple-branch
+                    # Unpack eval output (always just logit in eval mode)
+                    logit = outputs[0] if isinstance(outputs, tuple) else outputs
+                    loss = criterion(logit, targets)
+                except Exception as _val_exc:
+                    print(f"  ⚠️  WARNING: val forward failed ({type(_val_exc).__name__}: {_val_exc}). Skipping batch.")
+                    continue
 
                 val_running_loss += loss.item() * inputs.size(0)
 
@@ -751,16 +782,21 @@ def train_pytorch_model(image_data_dir=None, use_prnu=True,
     with torch.no_grad():
         dummy_img  = torch.randn(1, 3, IMG_HEIGHT, IMG_WIDTH).to(device)
         dummy_prnu = torch.zeros(1, PRNU_FEATURE_DIM).to(device)
-        traced_model = torch.jit.trace(model, (dummy_img, dummy_prnu))
+        dummy_map  = torch.zeros(1, 3, 128, 128).to(device)
+        traced_model = torch.jit.trace(model, (dummy_img, dummy_prnu, dummy_map))
         traced_model.save(FUSION_MODEL_TS_PATH)
-        del dummy_img, dummy_prnu, traced_model
+        del dummy_img, dummy_prnu, dummy_map, traced_model
     print(f"EfficientFusionNet (TorchScript) saved to: {FUSION_MODEL_TS_PATH}")
 
     # --- Export quantized int8 model for CPU inference (8x smaller) ---
     print("\n--- Exporting int8 quantized model ---")
     try:
         model_cpu = EfficientFusionNet()
-        model_cpu.load_state_dict(torch.load(FUSION_MODEL_PATH, map_location='cpu'))
+        try:
+            _sd = torch.load(FUSION_MODEL_PATH, map_location='cpu', weights_only=True)
+        except Exception:
+            _sd = torch.load(FUSION_MODEL_PATH, map_location='cpu')
+        model_cpu.load_state_dict(_sd)
         model_cpu.eval().cpu()
         quantized = torch.quantization.quantize_dynamic(
             model_cpu,
@@ -802,8 +838,8 @@ def main():
                         help='Disable PRNU feature branch (image-only CNN for comparison).')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from a checkpoint .pth file (e.g. models/checkpoint_latest.pth).')
-    parser.add_argument('--num_workers', type=int, default=2,
-                        help='DataLoader worker processes (use 0 on Colab if multiprocessing errors occur).')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader worker processes (keep 0 on Colab/Jupyter; set >0 only on bare-metal).')
     parser.add_argument('--epochs', type=int, default=EPOCHS,
                         help=f'Number of training epochs (default: {EPOCHS}).')
     parser.add_argument('--plot', action='store_true', default=True,

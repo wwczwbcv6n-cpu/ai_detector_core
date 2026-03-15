@@ -199,7 +199,11 @@ def load_model(device):
     if os.path.exists(v5_path):
         try:
             model = DeepFusionNet().to(device)
-            model.load_state_dict(torch.load(v5_path, map_location=device))
+            try:
+                _sd = torch.load(v5_path, map_location=device, weights_only=True)
+            except Exception:
+                _sd = torch.load(v5_path, map_location=device)
+            model.load_state_dict(_sd)
             print(f"  Loaded v5 checkpoint from {v5_path}")
             return model
         except Exception as e:
@@ -210,7 +214,11 @@ def load_model(device):
     if os.path.exists(cycle_path):
         try:
             model = DeepFusionNet().to(device)
-            model.load_state_dict(torch.load(cycle_path, map_location=device))
+            try:
+                _sd = torch.load(cycle_path, map_location=device, weights_only=True)
+            except Exception:
+                _sd = torch.load(cycle_path, map_location=device)
+            model.load_state_dict(_sd)
             print(f"  Resumed from cycle checkpoint.")
             return model
         except Exception as e:
@@ -345,6 +353,8 @@ def download_civitai_images(dest_dir: str, count: int) -> list[str]:
             break
 
         _civitai_page += 1
+        # Respect Civitai rate limit: 10 req/min → 6 s between pages
+        time.sleep(6)
         img_urls = [
             it['url'] for it in items
             if it.get('type') == 'image' and not it.get('nsfw', True)
@@ -816,7 +826,7 @@ def _write_status(total_videos, cycle_num, last_loss, total_frames,
     try:
         os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
         tmp = STATUS_FILE + '.tmp'
-        with open(tmp, 'w') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(status, f)
         os.replace(tmp, STATUS_FILE)
     except Exception:

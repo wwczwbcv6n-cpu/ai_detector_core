@@ -13,9 +13,10 @@ from torchvision import transforms
 # Model definitions
 from model_prnu import DeepFusionNet, EfficientFusionNet, PRNUFusionNet, UnifiedFusionNet
 from prnu import analyze_prnu, extract_noise_residual
-from prnu_features import extract_prnu_features, extract_prnu_features_fullres
+from prnu_features import extract_prnu_features, extract_prnu_features_fullres, extract_prnu_map
 from image_loader import UniversalImageLoader
 from prnu_recovery import build_prnu_recovery_net
+from prnu_cuda import PRNUExtractorGPU
 
 # --- Configuration ---
 IMG_WIDTH  = 512
@@ -61,6 +62,21 @@ PLATFORM_PROFILES = {
     'h265':      {'tier': 'medium',  'codec': 'H.265/HEVC',     'max_px': 3840,
                   'quality_range': (78, 90),  'prnu_reliability': 0.80,
                   'description': 'Generic H.265/HEVC encoded video frame'},
+    'av1':       {'tier': 'high',    'codec': 'AV1',            'max_px': 7680,
+                  'quality_range': (85, 98),  'prnu_reliability': 0.90,
+                  'description': 'AV1 codec — high efficiency, minimal compression loss'},
+    'vp9':       {'tier': 'high',    'codec': 'VP9',            'max_px': 4096,
+                  'quality_range': (80, 95),  'prnu_reliability': 0.88,
+                  'description': 'VP9 codec — open format, good quality retention'},
+    'vp8':       {'tier': 'medium',  'codec': 'VP8',            'max_px': 1920,
+                  'quality_range': (65, 80),  'prnu_reliability': 0.68,
+                  'description': 'VP8 codec — older format, moderate compression'},
+    'webm':      {'tier': 'high',    'codec': 'VP9/AV1',        'max_px': 4096,
+                  'quality_range': (82, 96),  'prnu_reliability': 0.88,
+                  'description': 'WebM container (VP8/VP9/AV1)'},
+    'mp4':       {'tier': 'medium',  'codec': 'H.264/H.265/AV1','max_px': 3840,
+                  'quality_range': (72, 90),  'prnu_reliability': 0.78,
+                  'description': 'Generic MP4 container (H.264/H.265/AV1)'},
 }
 
 # Aliases accepted in the ?platform= query param
@@ -73,6 +89,8 @@ _PLATFORM_ALIASES = {
     'avc':        'h264',
     'h264/h265':  'h265',
     'hevc':       'h265',
+    'mkv':        'webm',
+    'matroska':   'webm',
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -252,6 +270,16 @@ class Detector:
             print(f"  PRNU recovery net unavailable: {e}")
             self.recovery_net = None
 
+        # --- GPU PRNU extractor (matches training path for consistency) ---
+        self.prnu_gpu = None
+        if self.device.type == 'cuda':
+            try:
+                self.prnu_gpu = PRNUExtractorGPU(self.device, map_size=128)
+                self.prnu_gpu.eval()
+                print("  PRNUExtractorGPU: active (GPU extraction consistent with training)")
+            except Exception as _e:
+                print(f"  PRNUExtractorGPU: unavailable ({_e}) — using CPU extraction")
+
         # --- Step 0: try UnifiedFusionNet v1 ---
         if os.path.exists(UNIFIED_MODEL_PATH):
             try:
@@ -295,7 +323,7 @@ class Detector:
                     f"Please train the model first."
                 )
             self.model = _PyTorchCNN(num_classes=1).to(self.device)
-            state = torch.load(OLD_MODEL_PATH, map_location=self.device)
+            state = torch.load(OLD_MODEL_PATH, map_location=self.device, weights_only=True)
             self.model.load_state_dict(state)
             self.model.eval()
             self._model_type = 'PyTorchCNN (legacy)'
@@ -341,30 +369,44 @@ class Detector:
 
         img_tensor = self.transform(img).unsqueeze(0).to(self.device)
 
-        # --- PRNU features (32-dim with optional recovery net) ---
-        prnu_feats_np = extract_prnu_features_fullres(
-            img,
-            recovery_net=self.recovery_net,
-            device=self.device,
-        )
-        # Truncate/pad to expected dim (handles v4 vs v5 gracefully)
-        if len(prnu_feats_np) != self.prnu_dim:
-            tmp = np.zeros(self.prnu_dim, dtype=np.float32)
-            n   = min(len(prnu_feats_np), self.prnu_dim)
-            tmp[:n] = prnu_feats_np[:n]
-            prnu_feats_np = tmp
-
-        prnu_tensor = torch.from_numpy(prnu_feats_np).unsqueeze(0).float().to(self.device)
-
-        # --- PRNU spatial noise map (B, 3, 128, 128) for PRNUSpatialBranch ---
+        # --- PRNU features + spatial map ---
+        # Use GPU extractor when available — matches training pipeline exactly.
+        # Fall back to CPU (wavelet) path if GPU extractor is absent/fails.
+        prnu_tensor     = None
         prnu_map_tensor = None
-        if self.use_fusion:
+
+        if self.prnu_gpu is not None:
             try:
-                noise_img = img.resize((128, 128), Image.BILINEAR)
-                noise_arr = np.array(noise_img).astype(np.float64) / 255.0
-                noise_map = extract_noise_residual(noise_arr)          # (128, 128, 3)
-                noise_map = np.clip(noise_map, -1.0, 1.0).astype(np.float32)
-                noise_map = noise_map.transpose(2, 0, 1)               # (3, 128, 128)
+                _mean  = torch.tensor([0.485, 0.456, 0.406],
+                                      device=self.device).view(1, 3, 1, 1)
+                _std   = torch.tensor([0.229, 0.224, 0.225],
+                                      device=self.device).view(1, 3, 1, 1)
+                imgs_01 = (img_tensor * _std + _mean).clamp(0, 1)
+                with torch.no_grad():
+                    _feats, _map = self.prnu_gpu.extract_both(imgs_01)   # (1,64), (1,3,128,128)
+                prnu_tensor     = _feats.float()
+                prnu_map_tensor = _map.float()
+            except Exception as _pe:
+                print(f"  GPU PRNU extraction failed ({_pe}) — falling back to CPU")
+
+        if prnu_tensor is None:
+            # CPU wavelet fallback
+            prnu_feats_np = extract_prnu_features_fullres(
+                img,
+                recovery_net=self.recovery_net,
+                device=self.device,
+            )
+            if len(prnu_feats_np) != self.prnu_dim:
+                tmp = np.zeros(self.prnu_dim, dtype=np.float32)
+                n   = min(len(prnu_feats_np), self.prnu_dim)
+                tmp[:n] = prnu_feats_np[:n]
+                prnu_feats_np = tmp
+            prnu_tensor = torch.from_numpy(prnu_feats_np).unsqueeze(0).float().to(self.device)
+
+        if prnu_map_tensor is None and self.use_fusion:
+            try:
+                noise_map = extract_prnu_map(img, output_size=128)     # (128,128,3) [-1,1]
+                noise_map = noise_map.transpose(2, 0, 1)               # (3,128,128)
                 prnu_map_tensor = torch.from_numpy(noise_map).unsqueeze(0).to(self.device)
             except Exception as e:
                 print(f"  PRNU spatial map extraction failed: {e}")

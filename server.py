@@ -68,9 +68,22 @@ MODEL_VERSION = "4.0-RAG+CAG"
 SUPPORTED_FORMATS = [
     "image/jpeg", "image/png", "image/webp", "image/gif",
     "image/heic", "image/heif",              # Apple HEIC/HEIF
-    "image/avif",                            # AVIF (pillow-heif)
+    "image/avif",                            # AVIF (pillow-heif / AV1-coded HEIF)
     "image/tiff", "image/bmp",
 ]
+
+# Video containers / codecs supported by /analyze/video
+SUPPORTED_VIDEO_FORMATS = [
+    "video/mp4",           # H.264 / H.265 / AV1 in MP4
+    "video/webm",          # VP8 / VP9 / AV1 in WebM
+    "video/quicktime",     # .mov  (Apple QuickTime)
+    "video/x-matroska",    # .mkv  (Matroska)
+    "video/x-msvideo",     # .avi  (legacy AVI)
+    "video/mp2t",          # .ts   (MPEG-2 Transport Stream)
+    "video/3gpp",          # .3gp  (mobile)
+]
+
+_VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.ts', '.3gp'}
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 try:
@@ -121,6 +134,31 @@ def _decode_image(file_storage) -> bytes:
         return buf.getvalue()
 
     return raw
+
+
+def _detect_video_ext(raw: bytes) -> str:
+    """
+    Sniff container format from magic bytes → return extension (.mp4, .webm, …).
+    Falls back to '.mp4' when unrecognised.
+    """
+    if len(raw) < 12:
+        return '.mp4'
+    # ISO Base Media (MP4/MOV/M4V/HEIC/AVIF): 'ftyp' box at byte 4
+    if raw[4:8] == b'ftyp':
+        brand = raw[8:12]
+        if brand in (b'qt  ', b'mov '):
+            return '.mov'
+        return '.mp4'
+    # WebM / Matroska: EBML header 0x1A 0x45 0xDF 0xA3
+    if raw[:4] == b'\x1a\x45\xdf\xa3':
+        return '.webm'
+    # AVI: 'RIFF' ... 'AVI '
+    if raw[:4] == b'RIFF' and len(raw) >= 12 and raw[8:12] == b'AVI ':
+        return '.avi'
+    # MPEG-TS: sync byte 0x47 every 188 bytes
+    if raw[0] == 0x47:
+        return '.ts'
+    return '.mp4'
 
 
 def _run_analysis(
@@ -250,14 +288,17 @@ def health():
 def capabilities():
     """Return supported formats and model capabilities — used by Swift client."""
     return jsonify({
-        "supported_formats":   SUPPORTED_FORMATS,
-        "heic_support":        _HEIC_SUPPORT,
-        "max_upload_bytes":    app.config['MAX_CONTENT_LENGTH'],
+        "supported_image_formats": SUPPORTED_FORMATS,
+        "supported_video_formats": SUPPORTED_VIDEO_FORMATS,
+        "heic_support":            _HEIC_SUPPORT,
+        "max_upload_bytes":        app.config['MAX_CONTENT_LENGTH'],
         "endpoints": {
-            "analyze":       "POST /analyze        — full analysis",
-            "analyze_frame": "POST /analyze/frame  — fast frame (no heatmap)",
-            "analyze_heic":  "POST /analyze/heic   — HEIC/ProRAW optimised",
-            "analyze_batch": "POST /analyze/batch  — up to 8 images",
+            "analyze":              "POST /analyze              — full image analysis",
+            "analyze_video":        "POST /analyze/video        — video AI detection (MP4/WebM/AV1/MOV/MKV)",
+            "analyze_frame":        "POST /analyze/frame        — fast single frame (no heatmap)",
+            "analyze_heic":         "POST /analyze/heic         — HEIC/ProRAW optimised",
+            "analyze_batch":        "POST /analyze/batch        — up to 8 images",
+            "analyze_compression":  "POST /analyze/compression  — compression history",
         },
         "platform_hint": {
             "param":       "?platform=<name>  (optional query parameter)",
@@ -266,16 +307,23 @@ def capabilities():
             "supported": [
                 "youtube", "vimeo", "tiktok", "instagram",
                 "facebook", "twitter", "snapchat",
-                "telegram",           # MTProto / Telegram photo send
-                "heic",               # Apple HEIC/HEIF (alias: heif, apple)
-                "h264",               # generic H.264/AVC (alias: avc)
-                "h265",               # generic H.265/HEVC (alias: hevc, h264/h265)
+                "telegram",
+                "heic",    # Apple HEIC/HEIF  (aliases: heif, apple)
+                "h264",    # H.264/AVC        (alias: avc)
+                "h265",    # H.265/HEVC       (aliases: hevc, h264/h265)
+                "av1",     # AV1 codec
+                "vp9",     # VP9 codec
+                "vp8",     # VP8 codec
+                "webm",    # WebM container   (aliases: mkv, matroska)
+                "mp4",     # MP4 container
             ],
             "aliases": {
                 "x": "twitter", "twitter/x": "twitter",
                 "heif": "heic", "apple": "heic",
                 "mtproto": "telegram",
-                "avc": "h264", "hevc": "h265", "h264/h265": "h265",
+                "avc": "h264",
+                "hevc": "h265", "h264/h265": "h265",
+                "mkv": "webm", "matroska": "webm",
             },
         },
         "model_version": MODEL_VERSION,
@@ -468,6 +516,113 @@ def analyze_batch():
             results.append({"filename": f.filename, "error": str(e)})
 
     return jsonify({"results": results})
+
+
+# ── Video AI detection ────────────────────────────────────────────────────────
+
+@app.route('/analyze/video', methods=['POST'])
+def analyze_video():
+    """
+    Analyze a video file for AI-generated content.
+
+    Accepts
+    -------
+    multipart/form-data  field 'video' or 'file'   (file upload)
+    application/octet-stream                        (raw bytes in body)
+
+    Supported containers / codecs
+    -----------------------------
+    MP4  (H.264 / H.265 / AV1)
+    WebM (VP8 / VP9 / AV1)
+    MOV  (Apple QuickTime)
+    MKV  (Matroska)
+    AVI, TS, 3GP
+
+    Query params
+    ------------
+    platform        — optional hint: youtube | tiktok | av1 | vp9 | mp4 | webm …
+    screen_frames   — frames for Stage 1 quick PRNU screen  (default: 8)
+    full_frames     — frames for Stage 2 full analysis       (default: 24)
+
+    Response JSON
+    -------------
+    ai_probability              float [0-1]
+    conclusion                  "AI-Generated" | "REAL"
+    method                      "cascade_video" | "stage1_only"
+    frames_analyzed             int
+    stage1_score                float
+    frame_model_probability     float
+    prnu_temporal_consistency   float
+    frame_scores                list[float]
+    model_type                  str
+    platform_compression        dict | null
+    inference_ms                float
+    server_version              str
+    """
+    if detector is None:
+        return jsonify({"error": "Detector not initialised"}), 500
+
+    import tempfile
+
+    try:
+        ext = '.mp4'
+        if request.content_type and 'octet-stream' in request.content_type:
+            raw = request.get_data()
+            ext = _detect_video_ext(raw)
+        elif 'video' in request.files:
+            f   = request.files['video']
+            raw = f.read()
+            ext = os.path.splitext(f.filename or '.mp4')[1].lower() or '.mp4'
+        elif 'file' in request.files:
+            f   = request.files['file']
+            raw = f.read()
+            ext = os.path.splitext(f.filename or '.mp4')[1].lower() or '.mp4'
+        else:
+            return jsonify({
+                "error": "Send video as body (octet-stream) or 'video'/'file' form field."
+            }), 400
+
+        if not raw:
+            return jsonify({"error": "Empty file received."}), 400
+
+        if ext not in _VIDEO_EXTENSIONS:
+            return jsonify({
+                "error": f"Unsupported extension '{ext}'. "
+                         f"Supported: {', '.join(sorted(_VIDEO_EXTENSIONS))}"
+            }), 415
+
+        platform      = request.args.get('platform', None)
+        screen_frames = min(int(request.args.get('screen_frames', 8)),  64)
+        full_frames   = min(int(request.args.get('full_frames',   24), ), 120)
+
+        t0 = time.perf_counter()
+
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+
+        try:
+            result = detector.predict_video(
+                tmp_path,
+                n_screen_frames=screen_frames,
+                n_full_frames=full_frames,
+                platform=platform,
+            )
+        finally:
+            os.unlink(tmp_path)
+
+        if 'error' in result:
+            return jsonify(result), 422
+
+        result['inference_ms']   = round((time.perf_counter() - t0) * 1000, 1)
+        result['server_version'] = MODEL_VERSION
+        return jsonify(result)
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 415
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Internal error: {e}"}), 500
 
 
 # ── Compression analysis (UMFRE) ──────────────────────────────────────────────
@@ -744,11 +899,12 @@ def main():
     print(f"  RAG store      : {rag_store.stats()['total_cases']} cases indexed")
     print(f"  Cache          : {det_cache.stats()['db_entries']} entries persisted")
     print()
-    print("  POST /analyze/compression  — compression history (JPEG/PNG/WebP/HEIC/HEIF/AVIF/MP4/WebM/H.264/H.265/AV1/VP9/VP8)")
-    print("  POST /analyze              — full analysis (?rag=true &explain=true)")
+    print("  POST /analyze              — full image analysis (?rag=true &explain=true)")
+    print("  POST /analyze/video        — video AI detection (MP4/WebM/AV1/MOV/MKV …)")
     print("  POST /analyze/heic         — HEIC/ProRAW direct (Swift-optimised)")
-    print("  POST /analyze/frame        — fast frame (no heatmap)")
+    print("  POST /analyze/frame        — fast single frame (no heatmap)")
     print("  POST /analyze/batch        — up to 8 images (?rag=true &explain=true)")
+    print("  POST /analyze/compression  — compression history (JPEG/PNG/WebP/HEIC/AVIF/MP4/WebM/AV1/VP9/VP8)")
     print("  GET  /health               — server + RAG + cache status")
     print("  GET  /capabilities         — formats and model info")
     print("  GET  /rag/stats            — RAG vector store stats")
@@ -757,8 +913,24 @@ def main():
     print("  GET  /cache/stats          — cache stats")
     print("  POST /cache/clear          — clear cache")
     print("  GET  /explain/info         — LLM explainer info")
-    print("  Listening on http://0.0.0.0:8080\n")
-    app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
+    # Colab binds only to localhost; expose via ngrok or similar tunnel
+    try:
+        import google.colab  # noqa: F401
+        _in_colab = True
+    except ImportError:
+        _in_colab = False
+
+    _host = 'localhost' if _in_colab else '0.0.0.0'
+    _port = int(os.environ.get('PORT', 8080))
+
+    if _in_colab:
+        print("  [Colab] Binding to localhost — use a tunnel to expose the API:")
+        print("    from pyngrok import ngrok; ngrok.connect(_port)")
+        print(f"  Listening on http://localhost:{_port}\n")
+    else:
+        print(f"  Listening on http://0.0.0.0:{_port}\n")
+
+    app.run(host=_host, port=_port, debug=False, threaded=True)
 
 
 if __name__ == '__main__':

@@ -530,7 +530,10 @@ def _load_model(device) -> DeepFusionNet:
         if not os.path.exists(path):
             continue
         try:
-            state = torch.load(path, map_location=device)
+            try:
+                state = torch.load(path, map_location=device, weights_only=True)
+            except Exception:
+                state = torch.load(path, map_location=device)
             if isinstance(state, dict) and 'model_state_dict' in state:
                 state = state['model_state_dict']
             model.load_state_dict(state)

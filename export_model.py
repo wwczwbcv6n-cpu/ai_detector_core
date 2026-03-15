@@ -77,7 +77,10 @@ class ExportWrapper(nn.Module):
 def load_model(weights_path: str) -> DeepFusionNet:
     model = DeepFusionNet()
     if os.path.exists(weights_path):
-        state = torch.load(weights_path, map_location='cpu')
+        try:
+            state = torch.load(weights_path, map_location='cpu', weights_only=True)
+        except Exception:
+            state = torch.load(weights_path, map_location='cpu')
         try:
             model.load_state_dict(state)
             print(f"✓ Loaded weights from {weights_path}")

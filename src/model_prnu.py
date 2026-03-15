@@ -37,6 +37,7 @@ Major enhancements over v5:
 """
 
 import os
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,6 +47,28 @@ from torchvision.models import (
     efficientnet_b3, EfficientNet_B3_Weights,
     mobilenet_v3_small, MobileNet_V3_Small_Weights,
 )
+
+_log = logging.getLogger(__name__)
+
+
+def _safe_branch(branch: nn.Module, *args, out_dim: int,
+                 B: int, device, dtype, **kwargs) -> torch.Tensor:
+    """
+    Call ``branch(*args, **kwargs)`` and return its output.
+    On ANY exception (shape mismatch, NaN, OOM, …) logs a warning and
+    returns a zero tensor of shape (B, out_dim) so training continues.
+    """
+    try:
+        out = branch(*args, **kwargs)
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            _log.warning("[_safe_branch] %s produced NaN/Inf — zeroing",
+                         branch.__class__.__name__)
+            return torch.zeros(B, out_dim, device=device, dtype=dtype)
+        return out
+    except Exception as exc:
+        _log.warning("[_safe_branch] %s failed (%s: %s) — zeroing output",
+                     branch.__class__.__name__, type(exc).__name__, exc)
+        return torch.zeros(B, out_dim, device=device, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +127,20 @@ class SRMBranch(nn.Module):
         self.head = nn.Sequential(nn.Flatten(), nn.Linear(64, out_features), nn.SiLU())
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        residual = torch.clamp(self.srm_conv(img), -3.0, 3.0)
-        return self.head(self.learn(residual))
+        try:
+            if img.dim() != 4:
+                raise ValueError(f"SRMBranch expects 4-D (B,C,H,W), got {img.shape}")
+            residual = torch.clamp(self.srm_conv(img), -3.0, 3.0)
+            out = self.head(self.learn(residual))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in SRMBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[SRMBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, self.head[-1].out_features
+                               if hasattr(self.head[-1], 'out_features') else 64,
+                               device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +174,22 @@ class ColorForensicsBranch(nn.Module):
         self.register_buffer('rgb_to_ycbcr', self._RGB_TO_YCBCR)
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1, 3, 1, 1)
-        std  = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1, 3, 1, 1)
-        rgb    = img * std + mean
-        ycbcr  = torch.einsum('ck,bkhw->bchw', self.rgb_to_ycbcr, rgb)
-        chroma = ycbcr[:, 1:, :, :]     # Cb and Cr
-        return self.head(self.conv(chroma))
+        try:
+            if img.dim() != 4 or img.shape[1] != 3:
+                raise ValueError(f"ColorForensicsBranch expects (B,3,H,W), got {img.shape}")
+            mean  = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1, 3, 1, 1)
+            std   = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1, 3, 1, 1)
+            rgb   = img * std + mean
+            ycbcr = torch.einsum('ck,bkhw->bchw', self.rgb_to_ycbcr, rgb)
+            chroma = ycbcr[:, 1:, :, :]
+            out   = self.head(self.conv(chroma))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in ColorForensicsBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[ColorForensicsBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 64, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -172,24 +217,39 @@ class FrequencyBranch(nn.Module):
         self.head = nn.Sequential(nn.Flatten(), nn.Linear(128, out_features), nn.SiLU())
 
     def _fft_map(self, x: torch.Tensor, size: int) -> torch.Tensor:
-        x_r = F.interpolate(x.unsqueeze(1), size=(size, size),
-                            mode='bilinear', align_corners=False).squeeze(1)
-        fft = torch.fft.fftshift(torch.fft.fft2(x_r), dim=(-2, -1))
-        mag = torch.log1p(torch.abs(fft))
-        b   = mag.shape[0]
-        lo  = mag.view(b, -1).min(dim=1)[0].view(b, 1, 1)
-        hi  = mag.view(b, -1).max(dim=1)[0].view(b, 1, 1)
-        return (mag - lo) / (hi - lo + 1e-8)
+        try:
+            x_r = F.interpolate(x.unsqueeze(1), size=(size, size),
+                                mode='bilinear', align_corners=False).squeeze(1)
+            fft = torch.fft.fftshift(torch.fft.fft2(x_r), dim=(-2, -1))
+            mag = torch.log1p(torch.abs(fft))
+            b   = mag.shape[0]
+            lo  = mag.view(b, -1).min(dim=1)[0].view(b, 1, 1)
+            hi  = mag.view(b, -1).max(dim=1)[0].view(b, 1, 1)
+            return (mag - lo) / (hi - lo + 1e-8)
+        except Exception as exc:
+            _log.warning("[FrequencyBranch._fft_map] %s — returning zeros", exc)
+            B = x.shape[0] if x.dim() >= 1 else 1
+            return torch.zeros(B, size, size, device=x.device, dtype=x.dtype)
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        gray = img.mean(dim=1)
-        s    = self._FREQ_SIZE
-        f1   = self._fft_map(gray, s)
-        f2   = F.interpolate(self._fft_map(gray, s // 2).unsqueeze(1),
-                             size=(s, s), mode='bilinear', align_corners=False).squeeze(1)
-        f3   = F.interpolate(self._fft_map(gray, s // 4).unsqueeze(1),
-                             size=(s, s), mode='bilinear', align_corners=False).squeeze(1)
-        return self.head(self.conv(torch.stack([f1, f2, f3], dim=1)))
+        try:
+            if img.dim() != 4:
+                raise ValueError(f"FrequencyBranch expects (B,C,H,W), got {img.shape}")
+            gray = img.mean(dim=1)
+            s    = self._FREQ_SIZE
+            f1   = self._fft_map(gray, s)
+            f2   = F.interpolate(self._fft_map(gray, s // 2).unsqueeze(1),
+                                 size=(s, s), mode='bilinear', align_corners=False).squeeze(1)
+            f3   = F.interpolate(self._fft_map(gray, s // 4).unsqueeze(1),
+                                 size=(s, s), mode='bilinear', align_corners=False).squeeze(1)
+            out  = self.head(self.conv(torch.stack([f1, f2, f3], dim=1)))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in FrequencyBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[FrequencyBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 128, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +277,17 @@ class PRNUBranchV2(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+        try:
+            if x.dim() != 2:
+                raise ValueError(f"PRNUBranchV2 expects (B, in_features), got {x.shape}")
+            out = self.mlp(x)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in PRNUBranchV2 output")
+            return out
+        except Exception as exc:
+            _log.warning("[PRNUBranchV2] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = x.shape[0] if x.dim() >= 1 else 1
+            return torch.zeros(B, 96, device=x.device, dtype=x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +328,17 @@ class SpatialCNNBranch(nn.Module):
         )
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        return self.head(self.conv(img))
+        try:
+            if img.dim() != 4:
+                raise ValueError(f"SpatialCNNBranch expects (B,C,H,W), got {img.shape}")
+            out = self.head(self.conv(img))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in SpatialCNNBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[SpatialCNNBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 128, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -308,11 +388,21 @@ class HallucinationBranch(nn.Module):
         )
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        feat   = self.backbone(img)               # (B, 576, H/32, W/32)
-        attn   = self.attention_gate(feat)        # (B, 1, H/32, W/32)
-        feat   = feat * attn                      # attended features
-        pooled = self.pool(feat)                  # (B, 576, 2, 2)
-        return self.head(pooled)
+        try:
+            if img.dim() != 4 or img.shape[1] != 3:
+                raise ValueError(f"HallucinationBranch expects (B,3,H,W), got {img.shape}")
+            feat   = self.backbone(img)
+            attn   = self.attention_gate(feat)
+            feat   = feat * attn
+            pooled = self.pool(feat)
+            out    = self.head(pooled)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in HallucinationBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[HallucinationBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 128, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +445,21 @@ class PRNUSpatialBranch(nn.Module):
         )
 
     def forward(self, prnu_map: torch.Tensor) -> torch.Tensor:
-        return self.head(self.conv(prnu_map))
+        try:
+            if prnu_map is None:
+                raise ValueError("prnu_map is None")
+            if prnu_map.dim() != 4 or prnu_map.shape[1] != 3:
+                raise ValueError(f"PRNUSpatialBranch expects (B,3,H,W), got {prnu_map.shape}")
+            out = self.head(self.conv(prnu_map))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in PRNUSpatialBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[PRNUSpatialBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = prnu_map.shape[0] if (prnu_map is not None and prnu_map.dim() >= 1) else 1
+            dev = prnu_map.device if prnu_map is not None else torch.device('cpu')
+            dtype = prnu_map.dtype if prnu_map is not None else torch.float32
+            return torch.zeros(B, 128, device=dev, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -430,27 +534,45 @@ class GANDiffusionFingerprintBranch(nn.Module):
 
     def _fft_spectrum(self, img: torch.Tensor) -> torch.Tensor:
         """Return log-magnitude FFT spectrum resized to (B,3,S,S)."""
-        B, C, H, W = img.shape
-        S = self._SPEC_SIZE
-        specs = []
-        for c in range(C):
-            ch  = img[:, c, :, :]                              # (B, H, W)
-            fft = torch.fft.fftshift(
-                torch.fft.fft2(ch, s=(S, S)), dim=(-2, -1)
-            )
-            mag = torch.log1p(torch.abs(fft))                 # (B, S, S)
-            # normalise per image
-            mn  = mag.flatten(1).min(1)[0].view(B, 1, 1)
-            mx  = mag.flatten(1).max(1)[0].view(B, 1, 1)
-            specs.append((mag - mn) / (mx - mn + 1e-8))
-        return torch.stack(specs, dim=1)                       # (B, 3, S, S)
+        try:
+            B, C, H, W = img.shape
+            if B == 0:
+                raise ValueError("Empty batch")
+            S = self._SPEC_SIZE
+            specs = []
+            for c in range(C):
+                ch  = img[:, c, :, :]
+                fft = torch.fft.fftshift(
+                    torch.fft.fft2(ch, s=(S, S)), dim=(-2, -1)
+                )
+                mag = torch.log1p(torch.abs(fft))
+                mn  = mag.flatten(1).min(1)[0].view(B, 1, 1)
+                mx  = mag.flatten(1).max(1)[0].view(B, 1, 1)
+                specs.append((mag - mn) / (mx - mn + 1e-8))
+            return torch.stack(specs, dim=1)
+        except Exception as exc:
+            _log.warning("[GANDiffusionBranch._fft_spectrum] %s — returning zeros", exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 3, self._SPEC_SIZE, self._SPEC_SIZE,
+                               device=img.device, dtype=img.dtype)
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        spec    = self._fft_spectrum(img)                      # (B,3,S,S)
-        spec_f  = self.spec_fc(self.spec_conv(spec))           # (B,128)
-        log_r   = self._log_response(img)                      # (B,3,H,W)
-        log_f   = self.log_fc(self.log_conv(log_r))            # (B,64)
-        return self.head(torch.cat([spec_f, log_f], dim=1))    # (B,out)
+        try:
+            if img.dim() != 4 or img.shape[1] != 3:
+                raise ValueError(f"GANDiffusionBranch expects (B,3,H,W), got {img.shape}")
+            spec   = self._fft_spectrum(img)
+            spec_f = self.spec_fc(self.spec_conv(spec))
+            log_r  = self._log_response(img)
+            log_f  = self.log_fc(self.log_conv(log_r))
+            out    = self.head(torch.cat([spec_f, log_f], dim=1))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in GANDiffusionBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[GANDiffusionFingerprintBranch] %s — returning zeros. (%s)",
+                         type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 128, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -535,21 +657,24 @@ class CMOSCCDSensorBranch(nn.Module):
         return F.conv2d(img, self._hp_kernel, padding=1, groups=3)
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        noise = self._high_pass(img)                           # (B,3,H,W)
-
-        # Column profile: mean along height → (B, 3, W)
-        col_profile = noise.mean(dim=2)                        # (B, 3, W)
-        col_f = self.col_fc(self.col_cnn(col_profile))         # (B, 64)
-
-        # Row profile: mean along width → (B, 3, H)
-        row_profile = noise.mean(dim=3)                        # (B, 3, H)
-        row_f = self.row_fc(self.row_cnn(row_profile))         # (B, 64)
-
-        # Local variance map (absolute value of noise as proxy)
-        var_map = noise.abs()                                  # (B, 3, H, W)
-        var_f = self.var_fc(self.var_conv(var_map))            # (B, 64)
-
-        return self.head(torch.cat([col_f, row_f, var_f], dim=1))  # (B, out)
+        try:
+            if img.dim() != 4 or img.shape[1] != 3:
+                raise ValueError(f"CMOSCCDSensorBranch expects (B,3,H,W), got {img.shape}")
+            noise = self._high_pass(img)
+            col_profile = noise.mean(dim=2)
+            col_f = self.col_fc(self.col_cnn(col_profile))
+            row_profile = noise.mean(dim=3)
+            row_f = self.row_fc(self.row_cnn(row_profile))
+            var_map = noise.abs()
+            var_f = self.var_fc(self.var_conv(var_map))
+            out = self.head(torch.cat([col_f, row_f, var_f], dim=1))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in CMOSCCDSensorBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[CMOSCCDSensorBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 96, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -605,30 +730,38 @@ class ColorChannelInconsistencyBranch(nn.Module):
         return phase / torch.pi                # normalise to [-1, 1]
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        # Un-normalise from ImageNet stats
-        mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1, 3, 1, 1)
-        std  = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1, 3, 1, 1)
-        rgb  = img * std + mean                                # (B, 3, H, W) in [0,1]
+        try:
+            if img.dim() != 4 or img.shape[1] != 3:
+                raise ValueError(f"ColorChannelInconsistencyBranch expects (B,3,H,W), got {img.shape}")
+            mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1, 3, 1, 1)
+            std  = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1, 3, 1, 1)
+            rgb  = img * std + mean
 
-        R, G, B = rgb[:, 0], rgb[:, 1], rgb[:, 2]             # each (B, H, W)
+            R, G, B_ch = rgb[:, 0], rgb[:, 1], rgb[:, 2]
 
-        S = self._SPEC_SIZE
-        # Spatial difference maps — resize to (B, 1, S, S)
-        def diff_map(a, b):
-            d = (a - b).unsqueeze(1)                          # (B,1,H,W)
-            return F.interpolate(d, size=(S, S), mode='bilinear', align_corners=False)
+            S = self._SPEC_SIZE
 
-        d_rg = diff_map(R, G)                                  # (B,1,S,S)
-        d_rb = diff_map(R, B)
-        d_gb = diff_map(G, B)
+            def diff_map(a, b):
+                d = (a - b).unsqueeze(1)
+                return F.interpolate(d, size=(S, S), mode='bilinear', align_corners=False)
 
-        # FFT phase maps — already (B, S, S)
-        p_rg = self._cross_phase(R, G, S).unsqueeze(1)        # (B,1,S,S)
-        p_rb = self._cross_phase(R, B, S).unsqueeze(1)
-        p_gb = self._cross_phase(G, B, S).unsqueeze(1)
+            d_rg = diff_map(R, G)
+            d_rb = diff_map(R, B_ch)
+            d_gb = diff_map(G, B_ch)
+            p_rg = self._cross_phase(R, G, S).unsqueeze(1)
+            p_rb = self._cross_phase(R, B_ch, S).unsqueeze(1)
+            p_gb = self._cross_phase(G, B_ch, S).unsqueeze(1)
 
-        feat = torch.cat([d_rg, d_rb, d_gb, p_rg, p_rb, p_gb], dim=1)  # (B,6,S,S)
-        return self.head(self.conv(feat))                       # (B, out)
+            feat = torch.cat([d_rg, d_rb, d_gb, p_rg, p_rb, p_gb], dim=1)
+            out  = self.head(self.conv(feat))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in ColorChannelInconsistencyBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[ColorChannelInconsistencyBranch] %s — returning zeros. (%s)",
+                         type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 96, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -692,29 +825,34 @@ class OpticalFlowIrregularityBranch(nn.Module):
         return F.conv2d(img, self._gauss_kernel, padding=2, groups=3)
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = img.shape
-        half_hw    = (max(H // 2, 16), max(W // 2, 16))
-        qtr_hw     = (max(H // 4, 8),  max(W // 4, 8))
+        try:
+            if img.dim() != 4 or img.shape[1] != 3:
+                raise ValueError(f"OpticalFlowIrregularityBranch expects (B,3,H,W), got {img.shape}")
+            B, C, H, W = img.shape
+            half_hw = (max(H // 2, 16), max(W // 2, 16))
+            qtr_hw  = (max(H // 4, 8),  max(W // 4, 8))
 
-        full    = self._blur(img)                              # (B,3,H,W)
+            full   = self._blur(img)
+            half_s = F.interpolate(img, size=half_hw, mode='bilinear', align_corners=False)
+            half_s = F.interpolate(self._blur(half_s), size=(H, W),
+                                   mode='bilinear', align_corners=False)
+            qtr_s  = F.interpolate(img, size=qtr_hw, mode='bilinear', align_corners=False)
+            qtr_s  = F.interpolate(self._blur(qtr_s), size=(H, W),
+                                   mode='bilinear', align_corners=False)
 
-        half_s  = F.interpolate(img, size=half_hw, mode='bilinear', align_corners=False)
-        half_s  = F.interpolate(self._blur(half_s), size=(H, W),
-                                mode='bilinear', align_corners=False)
-
-        qtr_s   = F.interpolate(img, size=qtr_hw,  mode='bilinear', align_corners=False)
-        qtr_s   = F.interpolate(self._blur(qtr_s),  size=(H, W),
-                                mode='bilinear', align_corners=False)
-
-        # Pseudo-flow fields: inter-scale differences
-        flow_fh = full   - half_s                              # (B,3,H,W)
-        flow_fq = full   - qtr_s                              # (B,3,H,W)
-        flow_hq = half_s - qtr_s                              # (B,3,H,W)
-
-        flow    = torch.cat([flow_fh, flow_fq, flow_hq], dim=1)  # (B,9,H,W)
-        # Clamp to avoid exploding values from large-scale differences
-        flow    = torch.clamp(flow, -1.0, 1.0)
-        return self.head(self.flow_conv(flow))                  # (B, out)
+            flow = torch.clamp(
+                torch.cat([full - half_s, full - qtr_s, half_s - qtr_s], dim=1),
+                -1.0, 1.0,
+            )
+            out = self.head(self.flow_conv(flow))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in OpticalFlowIrregularityBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[OpticalFlowIrregularityBranch] %s — returning zeros. (%s)",
+                         type(exc).__name__, exc)
+            B = img.shape[0] if img.dim() >= 1 else 1
+            return torch.zeros(B, 96, device=img.device, dtype=img.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +883,8 @@ class CrossAttentionFusion(nn.Module):
             batch_first=True,
             norm_first=True,   # pre-norm: more stable gradients
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers,
+                                                   enable_nested_tensor=False)
         self.pos_emb = nn.Parameter(
             torch.zeros(1, len(branch_dims), d_model)
         )
@@ -756,12 +895,26 @@ class CrossAttentionFusion(nn.Module):
         )
 
     def forward(self, branch_outputs: list) -> torch.Tensor:
-        tokens   = torch.stack(
-            [proj(b) for proj, b in zip(self.projs, branch_outputs)], dim=1
-        )                                         # (B, N_branches, d_model)
-        tokens   = tokens + self.pos_emb          # broadcast over batch
-        attended = self.transformer(tokens)       # (B, N_branches, d_model)
-        return self.head(attended.flatten(1))     # (B, out_dim)
+        try:
+            if not branch_outputs:
+                raise ValueError("CrossAttentionFusion received empty branch_outputs list")
+            tokens   = torch.stack(
+                [proj(b) for proj, b in zip(self.projs, branch_outputs)], dim=1
+            )
+            tokens   = tokens + self.pos_emb
+            attended = self.transformer(tokens)
+            out      = self.head(attended.flatten(1))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in CrossAttentionFusion output")
+            return out
+        except Exception as exc:
+            _log.warning("[CrossAttentionFusion] %s — returning zeros. (%s)",
+                         type(exc).__name__, exc)
+            B = branch_outputs[0].shape[0] if branch_outputs else 1
+            out_dim = self.head[0].out_features if hasattr(self.head[0], 'out_features') else 768
+            dev   = branch_outputs[0].device if branch_outputs else torch.device('cpu')
+            dtype = branch_outputs[0].dtype if branch_outputs else torch.float32
+            return torch.zeros(B, out_dim, device=dev, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -790,9 +943,16 @@ class BranchGate(nn.Module):
         )
 
     def forward(self, branch_outputs: list) -> list:
-        ctx = torch.cat(branch_outputs, dim=-1)   # (B, sum_dims)
-        w   = self.fc(ctx)                         # (B, n_branches)
-        return [b * w[:, i:i+1] for i, b in enumerate(branch_outputs)]
+        try:
+            if not branch_outputs:
+                raise ValueError("BranchGate received empty list")
+            ctx = torch.cat(branch_outputs, dim=-1)
+            w   = self.fc(ctx)
+            return [b * w[:, i:i+1] for i, b in enumerate(branch_outputs)]
+        except Exception as exc:
+            _log.warning("[BranchGate] %s — returning unweighted branches. (%s)",
+                         type(exc).__name__, exc)
+            return branch_outputs   # pass through unchanged on failure
 
 
 # ---------------------------------------------------------------------------
@@ -919,53 +1079,76 @@ class DeepFusionNet(nn.Module):
             prnu_map   : (B, 3, 128, 128) spatial PRNU noise map, or None
         """
         B = img.size(0)
+        _d, _t = img.device, img.dtype
 
-        # ── Backbone — gradient checkpointing saves ~300–600 MB during training
-        if self.use_ckpt and self.training:
-            cnn_out = grad_checkpoint(
-                lambda x: self.pool(self.backbone(x)).view(x.size(0), -1),
-                img, use_reentrant=False,
-            )
-        else:
-            cnn_out = self.pool(self.backbone(img)).view(B, -1)          # (B,1536)
+        def _z(dim): return torch.zeros(B, dim, device=_d, dtype=_t)
 
-        # ── v5 branches ──
-        srm_out           = self.srm_branch(img)                         # (B,64)
-        freq_out          = self.freq_branch(img)                        # (B,128)
-        color_out         = self.color_branch(img)                       # (B,64)
-        prnu_out          = self.prnu_branch_v2(prnu_feats)              # (B,96)
-        spatial_out       = self.spatial_branch(img)                     # (B,128)
-        halluc_out        = self.halluc_branch(img)                      # (B,128)
+        # ── Backbone ─────────────────────────────────────────────────────
+        try:
+            if self.use_ckpt and self.training:
+                cnn_out = grad_checkpoint(
+                    lambda x: self.pool(self.backbone(x)).view(x.size(0), -1),
+                    img, use_reentrant=False,
+                )
+            else:
+                cnn_out = self.pool(self.backbone(img)).view(B, -1)
+            if torch.isnan(cnn_out).any() or torch.isinf(cnn_out).any():
+                raise ValueError("NaN/Inf in backbone output")
+        except Exception as exc:
+            _log.warning("[DeepFusionNet] backbone failed (%s) — zeroing", exc)
+            cnn_out = _z(1536)
+
+        # ── Branches — each wrapped independently ────────────────────────
+        srm_out          = _safe_branch(self.srm_branch,          img,       out_dim=64,   B=B, device=_d, dtype=_t)
+        freq_out         = _safe_branch(self.freq_branch,         img,       out_dim=128,  B=B, device=_d, dtype=_t)
+        color_out        = _safe_branch(self.color_branch,        img,       out_dim=64,   B=B, device=_d, dtype=_t)
+        prnu_out         = _safe_branch(self.prnu_branch_v2,      prnu_feats,out_dim=96,   B=B, device=_d, dtype=_t)
+        spatial_out      = _safe_branch(self.spatial_branch,      img,       out_dim=128,  B=B, device=_d, dtype=_t)
+        halluc_out       = _safe_branch(self.halluc_branch,       img,       out_dim=128,  B=B, device=_d, dtype=_t)
+
         if prnu_map is None:
-            prnu_map = torch.zeros(B, 3, 128, 128, device=img.device, dtype=img.dtype)
-        prnu_spatial_out  = self.prnu_spatial_branch(prnu_map)           # (B,128)
+            prnu_map = torch.zeros(B, 3, 128, 128, device=_d, dtype=_t)
+        prnu_spatial_out = _safe_branch(self.prnu_spatial_branch, prnu_map,  out_dim=128,  B=B, device=_d, dtype=_t)
 
-        # ── v6 branches ──
-        gan_diff_out      = self.gan_diff_branch(img)                    # (B,128)
-        cmos_out          = self.cmos_branch(img)                        # (B,96)
-        color_incon_out   = self.color_incon_branch(img)                 # (B,96)
-        flow_out          = self.flow_branch(img)                        # (B,96)
+        gan_diff_out     = _safe_branch(self.gan_diff_branch,     img,       out_dim=128,  B=B, device=_d, dtype=_t)
+        cmos_out         = _safe_branch(self.cmos_branch,         img,       out_dim=96,   B=B, device=_d, dtype=_t)
+        color_incon_out  = _safe_branch(self.color_incon_branch,  img,       out_dim=96,   B=B, device=_d, dtype=_t)
+        flow_out         = _safe_branch(self.flow_branch,         img,       out_dim=96,   B=B, device=_d, dtype=_t)
 
-        # ── v6.1: SE-style branch gating before fusion ──
-        branch_list = [
-            cnn_out, srm_out, freq_out, color_out,
-            prnu_out, spatial_out, halluc_out, prnu_spatial_out,
-            gan_diff_out, cmos_out, color_incon_out, flow_out,
-        ]
-        branch_list = self.branch_gate(branch_list)
-        fused = self.fusion(branch_list)
-        logit = self.classifier(fused)                                   # (B,1)
+        # ── Gate + Fusion + Classifier ────────────────────────────────────
+        try:
+            branch_list = [
+                cnn_out, srm_out, freq_out, color_out,
+                prnu_out, spatial_out, halluc_out, prnu_spatial_out,
+                gan_diff_out, cmos_out, color_incon_out, flow_out,
+            ]
+            branch_list = self.branch_gate(branch_list)
+            fused = self.fusion(branch_list)
+            logit = self.classifier(fused)
+            if torch.isnan(logit).any() or torch.isinf(logit).any():
+                raise ValueError("NaN/Inf in classifier output")
+        except Exception as exc:
+            _log.warning("[DeepFusionNet] fusion/classifier failed (%s) — returning zeros", exc)
+            logit = _z(1)
 
         if self.training:
+            def _aux_safe(head, feat, name):
+                try:
+                    out = head(feat)
+                    return out if not (torch.isnan(out).any() or torch.isinf(out).any()) else _z(1)
+                except Exception as e:
+                    _log.warning("[DeepFusionNet] aux head %s failed (%s)", name, e)
+                    return _z(1)
+
             return (
                 logit,
-                self.prnu_aux_head(prnu_out),                            # (B,1)
-                self.halluc_aux_head(halluc_out),                        # (B,1)
-                self.prnu_spatial_aux_head(prnu_spatial_out),            # (B,1)
-                self.gan_diff_aux_head(gan_diff_out),                    # (B,1)
-                self.cmos_aux_head(cmos_out),                            # (B,1)
-                self.color_incon_aux_head(color_incon_out),              # (B,1)
-                self.flow_aux_head(flow_out),                            # (B,1)
+                _aux_safe(self.prnu_aux_head,         prnu_out,          "prnu"),
+                _aux_safe(self.halluc_aux_head,        halluc_out,        "halluc"),
+                _aux_safe(self.prnu_spatial_aux_head,  prnu_spatial_out,  "prnu_spatial"),
+                _aux_safe(self.gan_diff_aux_head,      gan_diff_out,      "gan_diff"),
+                _aux_safe(self.cmos_aux_head,          cmos_out,          "cmos"),
+                _aux_safe(self.color_incon_aux_head,   color_incon_out,   "color_incon"),
+                _aux_safe(self.flow_aux_head,          flow_out,          "flow"),
             )
 
         return logit
@@ -1035,46 +1218,102 @@ class PRNUBranch(nn.Module):
     """Legacy MLP for 16-dim PRNU vector (used in VideoTemporalFusionNet)."""
     def __init__(self, in_features: int = 16, out_features: int = 64):
         super().__init__()
+        self._out = out_features
         self.mlp = nn.Sequential(
             nn.Linear(in_features, 128), nn.SiLU(), nn.Dropout(p=0.2),
             nn.Linear(128, out_features), nn.SiLU(),
         )
-    def forward(self, x): return self.mlp(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            out = self.mlp(x)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in PRNUBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[PRNUBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = x.shape[0] if x.dim() >= 1 else 1
+            return torch.zeros(B, self._out, device=x.device, dtype=x.dtype)
 
 
 class PRNUDeepBranch(nn.Module):
     """MLP for 64-dim per-frame PRNU features → out_features-dim."""
     def __init__(self, in_features: int = 64, out_features: int = 64):
         super().__init__()
+        self._out = out_features
         self.mlp = nn.Sequential(
             nn.Linear(in_features, 128), nn.SiLU(), nn.Dropout(0.2),
             nn.Linear(128, 128),         nn.SiLU(), nn.Dropout(0.2),
             nn.Linear(128, out_features), nn.SiLU(),
         )
-    def forward(self, x): return self.mlp(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            out = self.mlp(x)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in PRNUDeepBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[PRNUDeepBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = x.shape[0] if x.dim() >= 1 else 1
+            return torch.zeros(B, self._out, device=x.device, dtype=x.dtype)
 
 
 class PRNUTemporalBranch(nn.Module):
     """MLP for 64-dim inter-frame PRNU drift vector → out_features-dim."""
     def __init__(self, in_features: int = 64, out_features: int = 32):
         super().__init__()
+        self._out = out_features
         self.mlp = nn.Sequential(
             nn.Linear(in_features, 128), nn.SiLU(), nn.Dropout(0.2),
             nn.Linear(128, out_features), nn.SiLU(),
         )
-    def forward(self, x): return self.mlp(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            out = self.mlp(x)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in PRNUTemporalBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[PRNUTemporalBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = x.shape[0] if x.dim() >= 1 else 1
+            return torch.zeros(B, self._out, device=x.device, dtype=x.dtype)
 
 
 class TemporalFlowBranch(nn.Module):
     def __init__(self, in_channels: int = 6, out_features: int = 64):
         super().__init__()
+        self._out = out_features
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 16, 3, padding=1, bias=False), nn.BatchNorm2d(16), nn.SiLU(), nn.MaxPool2d(2),
             nn.Conv2d(16, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.SiLU(), nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.SiLU(), nn.AdaptiveAvgPool2d((1,1)),
         )
         self.head = nn.Sequential(nn.Flatten(), nn.Linear(64, out_features), nn.SiLU())
-    def forward(self, flow): return self.head(self.conv(flow))
+
+    def forward(self, flow: torch.Tensor) -> torch.Tensor:
+        try:
+            if flow.dim() != 4:
+                raise ValueError(f"TemporalFlowBranch expects (B,C,H,W), got {flow.shape}")
+            # Auto-adapt channel count: pad with zeros or truncate to match conv weight.
+            expected_c = self.conv[0].in_channels
+            if flow.shape[1] != expected_c:
+                if flow.shape[1] < expected_c:
+                    pad = torch.zeros(flow.shape[0], expected_c - flow.shape[1],
+                                      flow.shape[2], flow.shape[3],
+                                      device=flow.device, dtype=flow.dtype)
+                    flow = torch.cat([flow, pad], dim=1)
+                else:
+                    flow = flow[:, :expected_c]
+            out = self.head(self.conv(flow))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in TemporalFlowBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[TemporalFlowBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = flow.shape[0] if flow.dim() >= 1 else 1
+            return torch.zeros(B, self._out, device=flow.device, dtype=flow.dtype)
 
 
 class MotionTemporalBranch(nn.Module):
@@ -1139,26 +1378,60 @@ class MotionTemporalBranch(nn.Module):
     def forward(self, motion_feats: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            motion_feats: (B, T, 24) or (B, 24) if single-pair
+            motion_feats: (B, T, 48) or (B, 48) if single-pair
         """
-        if motion_feats.dim() == 2:
-            motion_feats = motion_feats.unsqueeze(1)   # (B, 1, 24)
-        x      = self.norm(motion_feats)               # (B, T, 24)
-        out, _ = self.gru(x)                           # (B, T, 128)
-        pooled = out.mean(dim=1)                       # (B, 128) — temporal mean-pool
-        return self.head(pooled)                       # (B, out_features)
+        try:
+            if motion_feats.dim() == 2:
+                motion_feats = motion_feats.unsqueeze(1)   # (B, 1, 48)
+            if motion_feats.dim() != 3:
+                raise ValueError(f"MotionTemporalBranch expects (B,T,{self.MOTION_DIM}), got {motion_feats.shape}")
+            if motion_feats.shape[-1] != self.MOTION_DIM:
+                # Pad or truncate to expected dim
+                _log.warning("[MotionTemporalBranch] got last-dim %d, expected %d — padding/truncating",
+                             motion_feats.shape[-1], self.MOTION_DIM)
+                if motion_feats.shape[-1] < self.MOTION_DIM:
+                    pad = torch.zeros(*motion_feats.shape[:-1], self.MOTION_DIM - motion_feats.shape[-1],
+                                      device=motion_feats.device, dtype=motion_feats.dtype)
+                    motion_feats = torch.cat([motion_feats, pad], dim=-1)
+                else:
+                    motion_feats = motion_feats[..., :self.MOTION_DIM]
+            x      = self.norm(motion_feats)               # (B, T, 48)
+            out, _ = self.gru(x)                           # (B, T, 128)
+            pooled = out.mean(dim=1)                       # (B, 128) — temporal mean-pool
+            result = self.head(pooled)                     # (B, out_features)
+            if torch.isnan(result).any() or torch.isinf(result).any():
+                raise ValueError("NaN/Inf in MotionTemporalBranch output")
+            return result
+        except Exception as exc:
+            _log.warning("[MotionTemporalBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = motion_feats.shape[0] if motion_feats.dim() >= 1 else 1
+            out_dim = self.head[0].out_features if hasattr(self.head[0], 'out_features') else 128
+            return torch.zeros(B, out_dim, device=motion_feats.device, dtype=motion_feats.dtype)
 
 
 class AudioBranch(nn.Module):
     def __init__(self, out_features: int = 64):
         super().__init__()
+        self._out = out_features
         self.conv = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1, bias=False), nn.BatchNorm2d(16), nn.SiLU(), nn.MaxPool2d(2),
             nn.Conv2d(16, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.SiLU(), nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.SiLU(), nn.AdaptiveAvgPool2d((1,1)),
         )
         self.head = nn.Sequential(nn.Flatten(), nn.Linear(64, out_features), nn.SiLU())
-    def forward(self, mel): return self.head(self.conv(mel))
+
+    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        try:
+            if mel.dim() != 4:
+                raise ValueError(f"AudioBranch expects (B,1,F,T) mel-spectrogram, got {mel.shape}")
+            out = self.head(self.conv(mel))
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in AudioBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[AudioBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = mel.shape[0] if mel.dim() >= 1 else 1
+            return torch.zeros(B, self._out, device=mel.device, dtype=mel.dtype)
 
 
 class VideoTemporalFusionNet(nn.Module):
@@ -1244,27 +1517,56 @@ class VideoTemporalFusionNet(nn.Module):
         Returns (train mode):  (logit, motion_aux_logit)
         Returns (eval  mode):  logit  (B, 1)
         """
-        B   = img.size(0)
-        cnn = self.pool(self.backbone(img)).view(B, -1)   # (B, 1536)
-        flw = self.temporal_branch(flow)                  # (B, 64)
-        prn = self.prnu_branch(prnu_feats)                # (B, 64)
-        prd = self.prnu_temporal_branch(prnu_delta)       # (B, 32)
+        B  = img.size(0)
+        _d = img.device
+        _t = img.dtype
+
+        def _z(dim): return torch.zeros(B, dim, device=_d, dtype=_t)
+
+        # ── Backbone ─────────────────────────────────────────────────────
+        try:
+            cnn = self.pool(self.backbone(img)).view(B, -1)   # (B, 1536)
+            if torch.isnan(cnn).any() or torch.isinf(cnn).any():
+                raise ValueError("NaN/Inf in backbone output")
+        except Exception as exc:
+            _log.warning("[VideoTemporalFusionNet] backbone failed (%s) — zeroing", exc)
+            cnn = _z(self._CNN_DIM)
+
+        # ── Per-branch calls (each individually guarded via branch try-except) ─
+        flw = _safe_branch(self.temporal_branch,      flow,        out_dim=self._FLOW_DIM,     B=B, device=_d, dtype=_t)
+        prn = _safe_branch(self.prnu_branch,          prnu_feats,  out_dim=self._PRNU_DIM,     B=B, device=_d, dtype=_t)
+        prd = _safe_branch(self.prnu_temporal_branch, prnu_delta,  out_dim=self._PRNU_TEMP_DIM,B=B, device=_d, dtype=_t)
 
         # Motion branch — fall back to zeros if not provided
         if motion_feats is not None:
-            mot = self.motion_branch(motion_feats)        # (B, 128)
+            mot = _safe_branch(self.motion_branch, motion_feats, out_dim=self._MOTION_DIM, B=B, device=_d, dtype=_t)
         else:
-            mot = torch.zeros(B, self._MOTION_DIM,
-                              device=img.device, dtype=img.dtype)
+            mot = _z(self._MOTION_DIM)
 
+        # Audio branch — fall back to zeros if not provided or fails
         branches = [cnn, flw, prn, prd, mot]
         if self.use_audio and audio is not None:
-            branches.append(self.audio_branch(audio))
+            aud = _safe_branch(self.audio_branch, audio, out_dim=self._AUDIO_DIM, B=B, device=_d, dtype=_t)
+            branches.append(aud)
 
-        logit = self.classifier(self.fusion(branches))    # (B, 1)
+        # ── Fusion + Classifier ───────────────────────────────────────────
+        try:
+            logit = self.classifier(self.fusion(branches))   # (B, 1)
+            if torch.isnan(logit).any() or torch.isinf(logit).any():
+                raise ValueError("NaN/Inf in classifier output")
+        except Exception as exc:
+            _log.warning("[VideoTemporalFusionNet] fusion/classifier failed (%s) — returning zeros", exc)
+            logit = _z(1)
 
         if self.training:
-            return logit, self.motion_aux_head(mot)       # (B,1), (B,1)
+            try:
+                mot_aux = self.motion_aux_head(mot)
+                if torch.isnan(mot_aux).any() or torch.isinf(mot_aux).any():
+                    mot_aux = _z(1)
+            except Exception as exc:
+                _log.warning("[VideoTemporalFusionNet] motion_aux_head failed (%s)", exc)
+                mot_aux = _z(1)
+            return logit, mot_aux          # (B,1), (B,1)
         return logit
 
     def predict_proba(self, logits): return torch.sigmoid(logits)
@@ -1395,72 +1697,93 @@ class UnifiedFusionNet(nn.Module):
                 prnu_delta: torch.Tensor = None,
                 motion_feats: torch.Tensor = None,
                 mode: str = "image"):
-        B = img.size(0)
+        B  = img.size(0)
+        _d = img.device
+        _t = img.dtype
+
+        def _z(dim): return torch.zeros(B, dim, device=_d, dtype=_t)
 
         # ── Backbone ─────────────────────────────────────────────────────
-        if self.use_ckpt and self.training:
-            cnn_out = grad_checkpoint(
-                lambda x: self.pool(self.backbone(x)).view(x.size(0), -1),
-                img, use_reentrant=False,
-            )
-        else:
-            cnn_out = self.pool(self.backbone(img)).view(B, -1)          # (B,1536)
+        try:
+            if self.use_ckpt and self.training:
+                cnn_out = grad_checkpoint(
+                    lambda x: self.pool(self.backbone(x)).view(x.size(0), -1),
+                    img, use_reentrant=False,
+                )
+            else:
+                cnn_out = self.pool(self.backbone(img)).view(B, -1)      # (B,1536)
+            if torch.isnan(cnn_out).any() or torch.isinf(cnn_out).any():
+                raise ValueError("NaN/Inf in backbone output")
+        except Exception as exc:
+            _log.warning("[UnifiedFusionNet] backbone failed (%s) — zeroing", exc)
+            cnn_out = _z(1536)
 
-        # ── Image branches ────────────────────────────────────────────────
-        srm_out         = self.srm_branch(img)
-        freq_out        = self.freq_branch(img)
-        color_out       = self.color_branch(img)
-        prnu_out        = self.prnu_branch_v2(prnu_feats)
-        spatial_out     = self.spatial_branch(img)
-        halluc_out      = self.halluc_branch(img)
+        # ── Image branches (each independently guarded via _safe_branch) ─
+        srm_out         = _safe_branch(self.srm_branch,          img,        out_dim=64,  B=B, device=_d, dtype=_t)
+        freq_out        = _safe_branch(self.freq_branch,         img,        out_dim=128, B=B, device=_d, dtype=_t)
+        color_out       = _safe_branch(self.color_branch,        img,        out_dim=64,  B=B, device=_d, dtype=_t)
+        prnu_out        = _safe_branch(self.prnu_branch_v2,      prnu_feats, out_dim=96,  B=B, device=_d, dtype=_t)
+        spatial_out     = _safe_branch(self.spatial_branch,      img,        out_dim=128, B=B, device=_d, dtype=_t)
+        halluc_out      = _safe_branch(self.halluc_branch,       img,        out_dim=128, B=B, device=_d, dtype=_t)
+
         if prnu_map is None:
-            prnu_map = torch.zeros(B, 3, 128, 128, device=img.device, dtype=img.dtype)
-        prnu_spatial_out = self.prnu_spatial_branch(prnu_map)
-        gan_diff_out     = self.gan_diff_branch(img)
-        cmos_out         = self.cmos_branch(img)
-        color_incon_out  = self.color_incon_branch(img)
-        flow_irr_out     = self.flow_branch(img)
+            prnu_map = _z(3 * 128 * 128).view(B, 3, 128, 128)
+        prnu_spatial_out = _safe_branch(self.prnu_spatial_branch, prnu_map,  out_dim=128, B=B, device=_d, dtype=_t)
+        gan_diff_out     = _safe_branch(self.gan_diff_branch,    img,        out_dim=128, B=B, device=_d, dtype=_t)
+        cmos_out         = _safe_branch(self.cmos_branch,        img,        out_dim=96,  B=B, device=_d, dtype=_t)
+        color_incon_out  = _safe_branch(self.color_incon_branch, img,        out_dim=96,  B=B, device=_d, dtype=_t)
+        flow_irr_out     = _safe_branch(self.flow_branch,        img,        out_dim=96,  B=B, device=_d, dtype=_t)
 
-        # ── Video branches (zeros when mode != "video" or flow is None) ──
+        # ── Video branches (zeros in image mode) ─────────────────────────
         if mode == "video" and flow is not None:
-            temporal_out  = self.temporal_branch(flow)
-            prnu_deep_out = self.prnu_deep_branch(prnu_feats)
-            prnu_temp_out = self.prnu_temporal_branch(
-                prnu_delta if prnu_delta is not None
-                else torch.zeros_like(prnu_feats)
-            )
-            motion_out = self.motion_branch(
-                motion_feats if motion_feats is not None
-                else torch.zeros(B, 1, 48, device=img.device, dtype=img.dtype)
-            )
+            temporal_out  = _safe_branch(self.temporal_branch,      flow,       out_dim=64,  B=B, device=_d, dtype=_t)
+            prnu_deep_out = _safe_branch(self.prnu_deep_branch,     prnu_feats, out_dim=64,  B=B, device=_d, dtype=_t)
+            _delta = prnu_delta if prnu_delta is not None else torch.zeros_like(prnu_feats)
+            prnu_temp_out = _safe_branch(self.prnu_temporal_branch, _delta,     out_dim=32,  B=B, device=_d, dtype=_t)
+            _mf = motion_feats if motion_feats is not None else torch.zeros(B, 1, 48, device=_d, dtype=_t)
+            motion_out    = _safe_branch(self.motion_branch,        _mf,        out_dim=128, B=B, device=_d, dtype=_t)
         else:
-            temporal_out  = torch.zeros(B, 64,  device=img.device, dtype=img.dtype)
-            prnu_deep_out = torch.zeros(B, 64,  device=img.device, dtype=img.dtype)
-            prnu_temp_out = torch.zeros(B, 32,  device=img.device, dtype=img.dtype)
-            motion_out    = torch.zeros(B, 128, device=img.device, dtype=img.dtype)
+            temporal_out  = _z(64)
+            prnu_deep_out = _z(64)
+            prnu_temp_out = _z(32)
+            motion_out    = _z(128)
 
-        # ── Gate + fusion ─────────────────────────────────────────────────
-        branch_list = [
-            cnn_out, srm_out, freq_out, color_out,
-            prnu_out, spatial_out, halluc_out, prnu_spatial_out,
-            gan_diff_out, cmos_out, color_incon_out, flow_irr_out,
-            temporal_out, prnu_deep_out, prnu_temp_out, motion_out,
-        ]
-        branch_list = self.branch_gate(branch_list)
-        fused = self.fusion(branch_list)
-        logit = self.classifier(fused)                                   # (B,1)
+        # ── Gate + Fusion + Classifier ────────────────────────────────────
+        try:
+            branch_list = [
+                cnn_out, srm_out, freq_out, color_out,
+                prnu_out, spatial_out, halluc_out, prnu_spatial_out,
+                gan_diff_out, cmos_out, color_incon_out, flow_irr_out,
+                temporal_out, prnu_deep_out, prnu_temp_out, motion_out,
+            ]
+            branch_list = self.branch_gate(branch_list)
+            fused = self.fusion(branch_list)
+            logit = self.classifier(fused)                               # (B,1)
+            if torch.isnan(logit).any() or torch.isinf(logit).any():
+                raise ValueError("NaN/Inf in classifier output")
+        except Exception as exc:
+            _log.warning("[UnifiedFusionNet] fusion/classifier failed (%s) — returning zeros", exc)
+            logit = _z(1)
 
         if self.training:
+            def _aux_safe(head, feat, name):
+                try:
+                    out = head(feat)
+                    return out if not (torch.isnan(out).any() or torch.isinf(out).any()) else _z(1)
+                except Exception as e:
+                    _log.warning("[UnifiedFusionNet] aux head %s failed (%s)", name, e)
+                    return _z(1)
+
             return (
                 logit,
-                self.prnu_aux_head(prnu_out),
-                self.halluc_aux_head(halluc_out),
-                self.prnu_spatial_aux_head(prnu_spatial_out),
-                self.gan_diff_aux_head(gan_diff_out),
-                self.cmos_aux_head(cmos_out),
-                self.color_incon_aux_head(color_incon_out),
-                self.flow_aux_head(flow_irr_out),
-                self.motion_aux_head(motion_out),
+                _aux_safe(self.prnu_aux_head,         prnu_out,         "prnu"),
+                _aux_safe(self.halluc_aux_head,        halluc_out,       "halluc"),
+                _aux_safe(self.prnu_spatial_aux_head,  prnu_spatial_out, "prnu_spatial"),
+                _aux_safe(self.gan_diff_aux_head,      gan_diff_out,     "gan_diff"),
+                _aux_safe(self.cmos_aux_head,          cmos_out,         "cmos"),
+                _aux_safe(self.color_incon_aux_head,   color_incon_out,  "color_incon"),
+                _aux_safe(self.flow_aux_head,          flow_irr_out,     "flow"),
+                _aux_safe(self.motion_aux_head,        motion_out,       "motion"),
             )
         return logit
 
@@ -1510,7 +1833,10 @@ class UnifiedFusionNet(nn.Module):
         """
         net = cls()
         if image_ckpt_path and os.path.exists(image_ckpt_path):
-            sd = torch.load(image_ckpt_path, map_location=device)
+            try:
+                sd = torch.load(image_ckpt_path, map_location=device, weights_only=True)
+            except Exception:
+                sd = torch.load(image_ckpt_path, map_location=device)
             if 'model_state_dict' in sd:
                 sd = sd['model_state_dict']
             elif 'model_state' in sd:
@@ -1518,7 +1844,10 @@ class UnifiedFusionNet(nn.Module):
             net.load_state_dict(sd, strict=False)
             print(f"  Loaded image weights from {image_ckpt_path}")
         if video_ckpt_path and os.path.exists(video_ckpt_path):
-            sd = torch.load(video_ckpt_path, map_location=device)
+            try:
+                sd = torch.load(video_ckpt_path, map_location=device, weights_only=True)
+            except Exception:
+                sd = torch.load(video_ckpt_path, map_location=device)
             if 'model_state_dict' in sd:
                 sd = sd['model_state_dict']
             elif 'model_state' in sd:

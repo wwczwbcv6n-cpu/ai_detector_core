@@ -71,6 +71,7 @@ from training_dashboard import TrainingDashboard
 from prnu_features import (
     extract_prnu_features,
     extract_prnu_features_fullres,
+    extract_prnu_map,
     PRNU_FAST_DIM,
     PRNU_FULLRES_DIM,
 )
@@ -143,9 +144,14 @@ def _download_youtube_video(url, output_dir=TEMP_FRAMES, section_minutes=None):
     out_tmpl = os.path.join(output_dir, '%(id)s.%(ext)s')
 
     ydl_opts = {
-        # Best quality video + audio, merged to mp4 via ffmpeg.
-        # No codec/resolution restriction — get the highest available quality.
-        'format': 'bestvideo+bestaudio/best',
+        # Prefer H.264 (avc1) so OpenCV cv2 can decode without hardware AV1 support.
+        # Falls back to any non-AV1 mp4, then any mp4<=720p, then best available.
+        'format': (
+            'bestvideo[vcodec^=avc1][ext=mp4][height<=720]+bestaudio[ext=m4a]'
+            '/bestvideo[ext=mp4][height<=720][vcodec!^=av01]+bestaudio[ext=m4a]'
+            '/best[ext=mp4][height<=720]'
+            '/best'
+        ),
         'merge_output_format': 'mp4',
         'outtmpl': out_tmpl,
         'quiet': False,
@@ -468,8 +474,8 @@ _VIDEO_COMPRESSION_AUG = VideoCompressionAugment()
 class ImageDataset(Dataset):
     """
     Dataset for image training.
-    Returns (img_tensor, prnu_tensor_16dim, label_tensor).
-    PRNU is extracted at full 512px resolution then tiled.
+    Returns (img_tensor, prnu_64_tensor, prnu_map_tensor, label_tensor).
+    PRNU scalar features are 64-dim (v6 fullres); prnu_map is (3,128,128).
     """
     def __init__(self, image_paths, labels, transform=None):
         self.image_paths = image_paths
@@ -490,16 +496,26 @@ class ImageDataset(Dataset):
             print(f"  [warn] Cannot open {img_path}: {e}")
             image = Image.new('RGB', (IMG_SIZE, IMG_SIZE))
 
-        # ── Full-res PRNU (16-dim) ──
+        # ── Full-res PRNU scalar features (64-dim v6) ──
         try:
-            # Use a 512-px version for PRNU tiling (memory-safe for giant images)
             prnu_input = image.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR) \
                          if max(image.size) > IMG_SIZE * 2 else image
             arr = np.array(prnu_input, dtype=np.float64) / 255.0
             prnu_feats = extract_prnu_features_fullres(arr, tile_size=128)
+            if not np.isfinite(prnu_feats).all():
+                prnu_feats = np.zeros(PRNU_FULLRES_DIM, dtype=np.float32)
         except Exception as e:
             print(f"  [warn] PRNU failed for {img_path}: {e}")
             prnu_feats = np.zeros(PRNU_FULLRES_DIM, dtype=np.float32)
+
+        # ── PRNU spatial map (3×128×128) ──
+        try:
+            prnu_map_np = extract_prnu_map(image, output_size=128)   # (128,128,3)
+            if not np.isfinite(prnu_map_np).all():
+                prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
+        except Exception:
+            prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
+        prnu_map_t = torch.from_numpy(prnu_map_np.transpose(2, 0, 1)).float()
 
         if self.transform:
             image = self.transform(image)
@@ -507,6 +523,7 @@ class ImageDataset(Dataset):
         return (
             image,
             torch.from_numpy(prnu_feats).float(),
+            prnu_map_t,
             torch.tensor(label, dtype=torch.float32),
         )
 
@@ -603,10 +620,11 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
 
     train_ds = ImageDataset(X_tr, y_tr, transform=train_tf)
     val_ds   = ImageDataset(X_val, y_val, transform=val_tf)
+    num_workers = 0   # 0 = main process only (Colab-safe; avoids fork issues)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          num_workers=2, pin_memory=True)
+                          num_workers=num_workers, pin_memory=(num_workers > 0))
     val_dl   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                          num_workers=2, pin_memory=True)
+                          num_workers=num_workers, pin_memory=(num_workers > 0))
 
     print(f"\n  Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 
@@ -638,23 +656,39 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
         run_loss, correct, total = 0.0, 0, 0
         optimizer.zero_grad()
 
-        for i, (imgs, prnu_feats, targets) in enumerate(train_dl):
+        for i, (imgs, prnu_feats, prnu_maps, targets) in enumerate(train_dl):
             imgs       = imgs.to(device)
             prnu_feats = prnu_feats.to(device)
+            prnu_maps  = prnu_maps.to(device)
             targets    = targets.to(device).view(-1, 1)
 
-            with torch.amp.autocast(device.type, enabled=use_amp):
-                out = model(imgs, prnu_feats)
-                if isinstance(out, tuple):
-                    logits = out[0]
-                    # sum all aux losses (equal weight) + main loss
-                    loss = criterion(logits, targets)
-                    for aux in out[1:]:
-                        loss = loss + 0.2 * criterion(aux, targets)
-                    loss = loss / grad_accum
-                else:
-                    logits = out
-                    loss   = criterion(logits, targets) / grad_accum
+            try:
+                with torch.amp.autocast(device.type, enabled=use_amp):
+                    out = model(imgs, prnu_feats, prnu_maps)
+                    if isinstance(out, tuple):
+                        (logits, prnu_aux, halluc_aux, prnu_sp_aux,
+                         gan_aux, cmos_aux, col_aux, flow_aux, *rest) = out
+                        loss = (
+                            criterion(logits,      targets)
+                            + 0.35 * criterion(prnu_aux,   targets)
+                            + 0.15 * criterion(halluc_aux, targets)
+                            + 0.20 * criterion(prnu_sp_aux,targets)
+                            + 0.25 * criterion(gan_aux,    targets)
+                            + 0.20 * criterion(cmos_aux,   targets)
+                            + 0.20 * criterion(col_aux,    targets)
+                            + 0.15 * criterion(flow_aux,   targets)
+                        )
+                        if rest:   # motion aux head in video mode
+                            loss = loss + 0.15 * criterion(rest[0], targets)
+                        loss = loss / grad_accum
+                    else:
+                        logits = out
+                        loss   = criterion(logits, targets) / grad_accum
+            except Exception as _fwd_exc:
+                print(f"  ⚠️  WARNING: image train forward failed at batch {i+1} "
+                      f"({type(_fwd_exc).__name__}: {_fwd_exc}). Skipping.")
+                optimizer.zero_grad()
+                continue
 
             if torch.isnan(loss):
                 optimizer.zero_grad()
@@ -675,7 +709,7 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
             total += targets.size(0)
             correct += (preds == targets).sum().item()
 
-            del imgs, prnu_feats, targets, out, logits, loss
+            del imgs, prnu_feats, prnu_maps, targets, out, logits, loss
 
             if (i + 1) % 50 == 0:
                 ResourceGuard.check_or_abort(model, f"E{epoch+1} B{i+1}", IMAGE_MODEL_PATH)
@@ -697,17 +731,22 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
         model.eval()
         v_loss, v_correct, v_total = 0.0, 0, 0
         with torch.no_grad():
-            for imgs, prnu_feats, targets in val_dl:
-                imgs, prnu_feats, targets = (
-                    imgs.to(device),
-                    prnu_feats.to(device),
-                    targets.to(device).view(-1, 1),
-                )
-                out  = model(imgs, prnu_feats)
-                v_loss    += criterion(out, targets).item() * imgs.size(0)
-                preds = (torch.sigmoid(out) > 0.5).float()
-                v_total   += targets.size(0)
-                v_correct += (preds == targets).sum().item()
+            for imgs, prnu_feats, prnu_maps, targets in val_dl:
+                imgs       = imgs.to(device)
+                prnu_feats = prnu_feats.to(device)
+                prnu_maps  = prnu_maps.to(device)
+                targets    = targets.to(device).view(-1, 1)
+                try:
+                    out    = model(imgs, prnu_feats, prnu_maps)
+                    logits = out[0] if isinstance(out, tuple) else out
+                    v_loss    += criterion(logits, targets).item() * imgs.size(0)
+                    preds = (torch.sigmoid(logits) > 0.5).float()
+                    v_total   += targets.size(0)
+                    v_correct += (preds == targets).sum().item()
+                except Exception as _val_exc:
+                    print(f"  ⚠️  WARNING: image val forward failed "
+                          f"({type(_val_exc).__name__}: {_val_exc}). Skipping batch.")
+                    continue
 
         print(f"  Val   loss={v_loss/max(len(val_ds),1):.4f}  "
               f"acc={v_correct/max(v_total,1):.4f}")
@@ -1155,7 +1194,10 @@ def _load_checkpoint(model, optimizer, path):
     """Load checkpoint if it exists. Returns (start_epoch, start_step)."""
     if not os.path.exists(path):
         return 0, 0
-    ckpt = torch.load(path, map_location=device)
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+    except Exception:
+        ckpt = torch.load(path, map_location=device)
     try:
         missing, unexpected = model.load_state_dict(ckpt['model_state'], strict=False)
         # If too many keys mismatch the checkpoint is from a different architecture
@@ -1277,17 +1319,24 @@ def train_video_section(
                 audio_ts = None
             targets = targets.to(device).view(-1, 1)
 
-            with torch.amp.autocast(device.type, enabled=use_amp):
-                out = model(imgs, prnu_feats, None, flows, prnu_deltas, mode="video")
-                if isinstance(out, tuple):
-                    logits = out[0]
-                    loss = criterion(logits, targets)
-                    for aux in out[1:]:
-                        loss = loss + 0.2 * criterion(aux, targets)
-                    loss = loss / grad_accum
-                else:
-                    logits = out
-                    loss = criterion(logits, targets) / grad_accum
+            try:
+                with torch.amp.autocast(device.type, enabled=use_amp):
+                    out = model(imgs, prnu_feats, None, flows, prnu_deltas, mode="video")
+                    if isinstance(out, tuple):
+                        logits = out[0]
+                        loss = criterion(logits, targets)
+                        for aux in out[1:]:
+                            loss = loss + 0.2 * criterion(aux, targets)
+                        loss = loss / grad_accum
+                    else:
+                        logits = out
+                        loss = criterion(logits, targets) / grad_accum
+            except Exception as _fwd_exc:
+                print(f"  ⚠️  WARNING: video train forward failed at step {step+1} "
+                      f"({type(_fwd_exc).__name__}: {_fwd_exc}). Skipping.")
+                optimizer.zero_grad()
+                del imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets
+                continue
 
             if torch.isnan(loss):
                 optimizer.zero_grad()

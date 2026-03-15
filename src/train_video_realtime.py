@@ -586,7 +586,11 @@ def train_from_source(
     model = _build_model().to(device)
     if resume_model and os.path.exists(resume_model):
         print(f"  Loading model: {resume_model}")
-        model.load_state_dict(torch.load(resume_model, map_location=device))
+        try:
+            _sd = torch.load(resume_model, map_location=device, weights_only=True)
+        except Exception:
+            _sd = torch.load(resume_model, map_location=device)
+        model.load_state_dict(_sd)
         print("  ✓ Fine-tuning mode\n")
     else:
         print("  Starting fresh training\n")

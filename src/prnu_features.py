@@ -41,7 +41,9 @@ Feature vector layout — extract_prnu_features_fullres() — 64 values (v4):
 """
 
 import io
+import warnings
 import numpy as np
+import pywt
 from PIL import Image
 from scipy import fftpack
 from scipy.ndimage import uniform_filter
@@ -120,8 +122,10 @@ def extract_prnu_features_fullres(
         tile_residuals  = []   # per-tile mean noise residual (for inter-tile corr)
         tile_noises_3ch = []   # per-tile 3-channel noise (for band energy / cross-corr)
 
-        for row_start in range(0, h, tile_size):
-            for col_start in range(0, w, tile_size):
+        # 50% overlap stride so edge regions get sampled as often as centre
+        stride = tile_size // 2
+        for row_start in range(0, h, stride):
+            for col_start in range(0, w, stride):
                 tile = arr_for_prnu[row_start:row_start + tile_size,
                                     col_start:col_start + tile_size]
 
@@ -222,7 +226,7 @@ def extract_prnu_features_fullres(
         return np.zeros(PRNU_FULLRES_DIM, dtype=np.float32)
 
 
-def extract_prnu_map(image_input, output_size: int = 64) -> np.ndarray:
+def extract_prnu_map(image_input, output_size: int = 128) -> np.ndarray:
     """
     Extract spatial PRNU noise map at fixed output resolution.
 
@@ -734,15 +738,21 @@ def _extract_noise_intensity_normalized(img_array: np.ndarray) -> np.ndarray:
     Then zero-mean per row and column to remove stripe artefacts.
     """
     try:
-        denoised = denoise_wavelet(
-            img_array,
-            method='BayesShrink',
-            mode='soft',
-            wavelet='db4',
-            wavelet_levels=3,
-            channel_axis=-1,
-            rescale_sigma=True,
-        )
+        # Compute safe decomposition level for this image size.
+        # pywt warns (and degrades) if level > dwt_max_level; clamp to 3 max.
+        _min_dim = min(img_array.shape[:2])
+        _safe_level = min(3, pywt.dwt_max_level(_min_dim, 'db4'))
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='Level value.*too high')
+            denoised = denoise_wavelet(
+                img_array,
+                method='BayesShrink',
+                mode='soft',
+                wavelet='db4',
+                wavelet_levels=_safe_level,
+                channel_axis=-1,
+                rescale_sigma=True,
+            )
         noise = img_array - denoised
     except Exception:
         return np.zeros_like(img_array, dtype=np.float32)

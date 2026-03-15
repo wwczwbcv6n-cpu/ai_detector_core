@@ -183,7 +183,7 @@ def build_prnu_recovery_net(device=None) -> PRNURecoveryNet:
 
     if os.path.exists(RECOVERY_PATH):
         try:
-            state = torch.load(RECOVERY_PATH, map_location=device)
+            state = torch.load(RECOVERY_PATH, map_location=device, weights_only=True)
             net.load_state_dict(state)
             print(f"[prnu_recovery] Loaded weights from {RECOVERY_PATH}")
         except Exception as e:

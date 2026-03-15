@@ -1,12 +1,37 @@
 import os
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models
 from sklearn.model_selection import train_test_split
 import cv2
-import pyheif
 from PIL import Image
-from moviepy.video.io.VideoFileClip import VideoFileClip # Corrected import
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras import layers, models
+    _TF_AVAILABLE = True
+except ImportError:
+    tf = None
+    _TF_AVAILABLE = False
+    print("[train.py] TensorFlow not available — TF-based training disabled.")
+
+try:
+    import pyheif
+    _PYHEIF_AVAILABLE = True
+except ImportError:
+    try:
+        import pillow_heif as _pillow_heif
+        _pillow_heif.register_heif_opener()
+        _PYHEIF_AVAILABLE = False   # use pillow path instead
+    except ImportError:
+        _PYHEIF_AVAILABLE = False
+    pyheif = None
+
+try:
+    from moviepy.video.io.VideoFileClip import VideoFileClip
+    _MOVIEPY_AVAILABLE = True
+except ImportError:
+    VideoFileClip = None
+    _MOVIEPY_AVAILABLE = False
+    print("[train.py] moviepy not available — video loading disabled.")
 
 # --- Configuration ---
 IMG_WIDTH = 256

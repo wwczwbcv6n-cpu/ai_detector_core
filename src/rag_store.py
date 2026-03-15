@@ -88,7 +88,7 @@ class ImageRAGStore:
             if self._idx_path.exists() and self._map_path.exists():
                 try:
                     self._index = faiss.read_index(str(self._idx_path))
-                    with open(self._map_path) as f:
+                    with open(self._map_path, encoding='utf-8') as f:
                         self._id_map = json.load(f)
                     return
                 except Exception as e:
@@ -101,7 +101,7 @@ class ImageRAGStore:
             if npy_path.exists() and self._map_path.exists():
                 try:
                     self._np_matrix = np.load(str(npy_path))   # (N, D)
-                    with open(self._map_path) as f:
+                    with open(self._map_path, encoding='utf-8') as f:
                         self._id_map = json.load(f)
                     return
                 except Exception as e:
