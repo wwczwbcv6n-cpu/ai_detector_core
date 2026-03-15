@@ -67,12 +67,13 @@ from live_plot import LivePlot
 # ═══════════════════════════════════════════════════════════════════════════
 
 PRNU_FEATURE_DIM  = 64      # 32 in v5; 64 in v6
-IMG_SIZE          = 640
+IMG_SIZE          = 384     # reduced from 640 — faster T4 training (~2.8x speedup)
 BATCH_REAL        = 32
 BATCH_AI          = 32
 INNER_EPOCHS      = 1
 GRAD_ACCUM_STEPS  = 8
-LOADER_BATCH_SIZE = 4
+LOADER_BATCH_SIZE = 8       # increased from 4 — better GPU utilization
+PRNU_TILE_SIZE    = 256     # reduced from 1024 — ~16x faster PRNU extraction
 
 LAMBDA_PRNU          = 0.35   # PRNU scalar features aux loss weight
 LAMBDA_HALLUC        = 0.15   # Hallucination aux loss weight
@@ -472,6 +473,7 @@ class StreamBatchDataset(Dataset):
             try:
                 prnu = extract_prnu_features_fullres(
                     img,
+                    tile_size=PRNU_TILE_SIZE,
                     recovery_net=self.recovery_net if label == 1 else None,
                     device=self.device,
                 )
