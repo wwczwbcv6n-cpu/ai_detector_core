@@ -15,6 +15,7 @@ import io
 import os
 import numpy as np
 from PIL import Image
+_BILINEAR = getattr(Image, 'Resampling', Image).BILINEAR  # Pillow 10+ compat
 
 # ── Optional dependencies ────────────────────────────────────────────────────
 
@@ -127,7 +128,7 @@ class UniversalImageLoader:
             PIL Image in RGB mode, resized to `size`
         """
         img = self.load(path_or_bytes, hint=hint)
-        return img.resize(size, Image.BILINEAR)
+        return img.resize(size, _BILINEAR)
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Internal helpers
@@ -199,7 +200,7 @@ class UniversalImageLoader:
         w, h = img.size
         if max(w, h) > _MAX_DIM:
             scale = _MAX_DIM / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+            img = img.resize((int(w * scale), int(h * scale)), _BILINEAR)
         return img
 
     @staticmethod
@@ -210,6 +211,6 @@ class UniversalImageLoader:
             scale = _MAX_DIM / max(h, w)
             new_w, new_h = int(w * scale), int(h * scale)
             pil = Image.fromarray((arr * 255).astype(np.uint8))
-            pil = pil.resize((new_w, new_h), Image.BILINEAR)
+            pil = pil.resize((new_w, new_h), _BILINEAR)
             return np.array(pil, dtype=np.float64) / 255.0
         return arr

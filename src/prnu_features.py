@@ -45,6 +45,7 @@ import warnings
 import numpy as np
 import pywt
 from PIL import Image
+_BILINEAR = getattr(Image, 'Resampling', Image).BILINEAR  # Pillow 10+ compat
 from scipy import fftpack
 from scipy.ndimage import uniform_filter
 try:
@@ -137,7 +138,7 @@ def extract_prnu_features_fullres(
                     continue
 
                 pil       = Image.fromarray((tile * 255).astype(np.uint8))
-                pil_small = pil.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR)
+                pil_small = pil.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR)
                 small     = np.array(pil_small, dtype=np.float64) / 255.0
 
                 noise = _extract_noise_intensity_normalized(small)
@@ -153,7 +154,7 @@ def extract_prnu_features_fullres(
             # Fallback: single pass on full image (downsampled)
             small_pil = Image.fromarray(
                 (arr_for_prnu * 255).astype(np.uint8)
-            ).resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR)
+            ).resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR)
             small = np.array(small_pil, dtype=np.float64) / 255.0
             noise = _extract_noise_intensity_normalized(small)
             feats = _compute_features(small, noise, compression_quality=None)
@@ -245,7 +246,7 @@ def extract_prnu_map(image_input, output_size: int = 128) -> np.ndarray:
         arr   = _load_fullres(image_input)                         # (H,W,3) float64
         small = Image.fromarray((arr * 255).astype(np.uint8))
         small = np.array(
-            small.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR), dtype=np.float64
+            small.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR), dtype=np.float64
         ) / 255.0
         noise = _extract_noise_intensity_normalized(small)   # (_FAST_SIZE, _FAST_SIZE, 3)
 
@@ -253,7 +254,7 @@ def extract_prnu_map(image_input, output_size: int = 128) -> np.ndarray:
         pil   = Image.fromarray(
             np.clip((noise + 0.5) * 127.5, 0, 255).astype(np.uint8)
         )
-        pil   = pil.resize((output_size, output_size), Image.BILINEAR)
+        pil   = pil.resize((output_size, output_size), _BILINEAR)
         result = np.array(pil, dtype=np.float32) / 127.5 - 1.0    # [-1,1]
         return result                                              # (output_size, output_size, 3)
     except Exception as e:
@@ -286,7 +287,7 @@ def extract_prnu_patch_map(
 
                 pil   = Image.fromarray((tile * 255).astype(np.uint8))
                 small = np.array(
-                    pil.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR),
+                    pil.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR),
                     dtype=np.float64
                 ) / 255.0
 
@@ -389,7 +390,7 @@ def _compute_recovery_delta_stats(
         def _small(a):
             pil = Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8))
             return np.array(
-                pil.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR), dtype=np.float64
+                pil.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR), dtype=np.float64
             ) / 255.0
 
         orig_s = _small(original_arr)
@@ -562,7 +563,7 @@ def _compute_bayer_cfa_residual(arr: np.ndarray) -> np.ndarray:
     try:
         pil   = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
         small = np.array(
-            pil.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR), dtype=np.float64
+            pil.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR), dtype=np.float64
         ) / 255.0
         H, W  = _FAST_SIZE, _FAST_SIZE
         gray  = small.mean(axis=-1)
@@ -658,7 +659,7 @@ def _compute_saturation_features(arr: np.ndarray) -> np.ndarray:
     try:
         pil  = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
         s    = np.array(
-            pil.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR), dtype=np.float64
+            pil.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR), dtype=np.float64
         ) / 255.0
         gray = s.mean(axis=-1)
 
@@ -696,7 +697,7 @@ def _compute_multiscale_consistency(arr: np.ndarray) -> np.ndarray:
         def _hpf(arr_in, size):
             pil   = Image.fromarray((np.clip(arr_in, 0, 1) * 255).astype(np.uint8))
             small = np.array(
-                pil.resize((size, size), Image.BILINEAR), dtype=np.float64
+                pil.resize((size, size), _BILINEAR), dtype=np.float64
             ) / 255.0
             gray  = small.mean(axis=-1)
             return (gray - uniform_filter(gray, size=5)).ravel()
@@ -912,13 +913,13 @@ def _load_and_downsample(image_input):
             arr = image_input
             if arr.shape[0] != _FAST_SIZE or arr.shape[1] != _FAST_SIZE:
                 pil = Image.fromarray((arr * 255).astype(np.uint8))
-                arr = np.array(pil.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR),
+                arr = np.array(pil.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR),
                                dtype=np.float64) / 255.0
             return arr, quality
         img = Image.fromarray(image_input.astype(np.uint8))
     else:
         raise TypeError(f"Unsupported type: {type(image_input)}")
-    img = img.resize((_FAST_SIZE, _FAST_SIZE), Image.BILINEAR)
+    img = img.resize((_FAST_SIZE, _FAST_SIZE), _BILINEAR)
     return np.array(img, dtype=np.float64) / 255.0, quality
 
 

@@ -1193,6 +1193,110 @@ EfficientFusionNet = DeepFusionNet
 PRNUFusionNet      = DeepFusionNet
 
 
+def check_checkpoint_compat(model: nn.Module, ckpt_path_or_state) -> dict:
+    """
+    Compare a checkpoint against the current model BEFORE loading it.
+
+    Reports which weights will be:
+      ✓ preserved      — checkpoint key exists + shapes match  → training kept
+      ~ new (random)   — key in model but not in checkpoint    → new branch, OK
+      ✗ shape mismatch — key exists in both but shapes differ  → TRAINING LOST
+      ✗ dropped keys   — key in checkpoint but not in model    → TRAINING LOST
+
+    Call this before any load_state_dict(strict=False) to detect accidental
+    renames or reshapes that would silently destroy past training.
+
+    Parameters
+    ----------
+    model              : the nn.Module about to receive the checkpoint
+    ckpt_path_or_state : path string  OR  already-loaded state_dict
+
+    Returns
+    -------
+    dict with keys: preserved, new_random, lost, shape_mismatch
+    """
+    import os as _os
+
+    # ── Load state dict ───────────────────────────────────────────────────
+    if isinstance(ckpt_path_or_state, (_os.PathLike, str)):
+        path = str(ckpt_path_or_state)
+        if not _os.path.exists(path):
+            print("  [compat] No checkpoint found — starting fresh.")
+            return {'preserved': [], 'new_random': [], 'lost': [], 'shape_mismatch': []}
+        try:
+            raw = torch.load(path, map_location='cpu', weights_only=True)
+        except Exception:
+            raw = torch.load(path, map_location='cpu')
+        if isinstance(raw, dict):
+            ckpt_sd = raw.get('model_state_dict', raw.get('model_state', raw))
+        else:
+            ckpt_sd = raw
+    else:
+        ckpt_sd = ckpt_path_or_state  # already a state dict
+
+    model_sd   = model.state_dict()
+    ckpt_keys  = set(ckpt_sd.keys())
+    model_keys = set(model_sd.keys())
+
+    preserved      = []
+    new_random     = []
+    lost           = []
+    shape_mismatch = []
+
+    for key in sorted(model_keys):
+        if key not in ckpt_keys:
+            new_random.append(key)
+        elif tuple(ckpt_sd[key].shape) != tuple(model_sd[key].shape):
+            shape_mismatch.append((
+                key,
+                tuple(ckpt_sd[key].shape),
+                tuple(model_sd[key].shape),
+            ))
+        else:
+            preserved.append(key)
+
+    for key in sorted(ckpt_keys):
+        if key not in model_keys:
+            lost.append(key)
+
+    # ── Report ────────────────────────────────────────────────────────────
+    has_problem = bool(lost or shape_mismatch)
+    sep = "═" * 56
+    print(f"\n  {sep}")
+    print(f"  Checkpoint Compatibility Report")
+    print(f"  {sep}")
+    print(f"  ✓ Preserved      : {len(preserved):4d} layers  (trained weights load correctly)")
+    if new_random:
+        print(f"  ~ New (random)   : {len(new_random):4d} layers  (new branches — OK, expected)")
+    if shape_mismatch:
+        print(f"  ✗ Shape mismatch : {len(shape_mismatch):4d} layers  ← PAST TRAINING LOST FOR THESE")
+        for key, cs, ms in shape_mismatch[:5]:
+            print(f"      {key}")
+            print(f"        saved {cs}  →  model {ms}")
+        if len(shape_mismatch) > 5:
+            print(f"      … and {len(shape_mismatch) - 5} more")
+    if lost:
+        print(f"  ✗ Dropped keys   : {len(lost):4d} layers  ← PAST TRAINING LOST FOR THESE")
+        for key in lost[:5]:
+            print(f"      {key}")
+        if len(lost) > 5:
+            print(f"      … and {len(lost) - 5} more")
+    if has_problem:
+        print(f"\n  ⚠  WARNING: architecture changed in a destructive way.")
+        print(f"     Rename or reshape a layer → its trained weights are gone.")
+        print(f"     Safe changes: ADD new branches (new_random above is fine).")
+    else:
+        print(f"  ✓ No training lost — safe to load.")
+    print(f"  {sep}\n")
+
+    return {
+        'preserved':      preserved,
+        'new_random':     new_random,
+        'lost':           lost,
+        'shape_mismatch': shape_mismatch,
+    }
+
+
 def quantize_model_for_inference(model: 'DeepFusionNet') -> nn.Module:
     """
     Apply post-training dynamic INT8 quantization to all nn.Linear layers.
@@ -1589,6 +1693,44 @@ class VideoTemporalFusionNet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+#  FormatForensicsBranch — 128-dim format feature → 96-dim embedding
+# ---------------------------------------------------------------------------
+
+class FormatForensicsBranch(nn.Module):
+    """
+    Process the 128-dim format feature vector produced by FormatAnalyzer.
+
+    LayerNorm first: handles zero-vector fallback gracefully and equalises
+    the mixed-scale inputs (one-hot flags mixed with normalised scalars).
+
+    Input:  (B, 128)
+    Output: (B, 96)
+    """
+
+    def __init__(self, in_features: int = 128, out_features: int = 96):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_features),
+            nn.Linear(in_features, 256), nn.SiLU(), nn.Dropout(0.15),
+            nn.Linear(256, 192),         nn.SiLU(), nn.Dropout(0.15),
+            nn.Linear(192, out_features), nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            if x.dim() != 2:
+                raise ValueError(f"FormatForensicsBranch expects (B, in_features), got {x.shape}")
+            out = self.mlp(x)
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                raise ValueError("NaN/Inf in FormatForensicsBranch output")
+            return out
+        except Exception as exc:
+            _log.warning("[FormatForensicsBranch] %s — returning zeros. (%s)", type(exc).__name__, exc)
+            B = x.shape[0] if x.dim() >= 1 else 1
+            return torch.zeros(B, 96, device=x.device, dtype=x.dtype)
+
+
+# ---------------------------------------------------------------------------
 #  UnifiedFusionNet v1 — single model for both image and video detection
 # ---------------------------------------------------------------------------
 
@@ -1600,18 +1742,19 @@ class UnifiedFusionNet(nn.Module):
     Image branches are always computed; video branches are zeroed in image mode.
 
     Image mode  (default, mode="image"):
-        forward(img, prnu_feats, prnu_map)
-        Train → (logit, *8_aux_logits)   Eval → logit
+        forward(img, prnu_feats, prnu_map, format_feats=None)
+        Train → (logit, *9_aux_logits)   Eval → logit
 
     Video mode  (mode="video"):
-        forward(img, prnu_feats, prnu_map, flow, prnu_delta, motion_feats, mode="video")
-        Train → (logit, *8_aux_logits)   Eval → logit
-        (index 8 = motion_aux, meaningful in video mode only)
+        forward(img, prnu_feats, prnu_map, flow, prnu_delta, motion_feats,
+                format_feats=None, mode="video")
+        Train → (logit, *9_aux_logits)   Eval → logit
+        (index 8 = motion_aux, index 9 = format_aux)
 
-    Branch layout (16 total, sum of dims = 1728):
+    Branch layout (17 total, sum of dims = 3072):
       Image:  backbone-1536, SRM-64, Freq-128, Color-64, PRNU-96,
               Spatial-128, Halluc-128, PRNUSpatial-128, GAN-128,
-              CMOS-96, ColorIncon-96, FlowIrreg-96
+              CMOS-96, ColorIncon-96, FlowIrreg-96, Format-96
       Video:  TemporalFlow-64, PRNUDeep-64, PRNUTemporal-32, MotionGRU-128
 
     Args:
@@ -1621,9 +1764,9 @@ class UnifiedFusionNet(nn.Module):
     """
 
     _FREEZE_RATIO    = 0.60
-    _IMG_BRANCH_DIMS = [1536, 64, 128, 64, 96, 128, 128, 128, 128, 96, 96, 96]
+    _IMG_BRANCH_DIMS = [1536, 64, 128, 64, 96, 128, 128, 128, 128, 96, 96, 96, 96]
     _VID_BRANCH_DIMS = [64, 64, 32, 128]
-    _ALL_DIMS        = _IMG_BRANCH_DIMS + _VID_BRANCH_DIMS   # 16 branches, sum=1728
+    _ALL_DIMS        = _IMG_BRANCH_DIMS + _VID_BRANCH_DIMS   # 17 branches, sum=3072
 
     def __init__(self, dropout: float = 0.4, prnu_in_features: int = 64,
                  gradient_checkpointing: bool = False):
@@ -1654,6 +1797,7 @@ class UnifiedFusionNet(nn.Module):
         self.cmos_branch         = CMOSCCDSensorBranch(out_features=96)
         self.color_incon_branch  = ColorChannelInconsistencyBranch(out_features=96)
         self.flow_branch         = OpticalFlowIrregularityBranch(out_features=96)
+        self.format_branch       = FormatForensicsBranch(in_features=128, out_features=96)
 
         # ── Video-specific branches ───────────────────────────────────────
         self.temporal_branch      = TemporalFlowBranch(in_channels=6, out_features=64)
@@ -1664,8 +1808,10 @@ class UnifiedFusionNet(nn.Module):
         # ── Unified gate + fusion (16 branches) ──────────────────────────
         self.branch_gate = BranchGate(self._ALL_DIMS)
         self.fusion = CrossAttentionFusion(
-            self._ALL_DIMS, out_dim=768, d_model=192, n_heads=4, n_layers=3
+            self._ALL_DIMS, out_dim=768, d_model=192, n_heads=4, n_layers=5
         )
+        # n_layers 3→5: adds 2 more transformer layers (new keys, safe with strict=False).
+        # Existing layers.0/1/2 load from checkpoint; layers.3/4 init randomly.
 
         # ── Classifier ───────────────────────────────────────────────────
         self.classifier = nn.Sequential(
@@ -1686,6 +1832,7 @@ class UnifiedFusionNet(nn.Module):
         self.color_incon_aux_head  = _aux(96)
         self.flow_aux_head         = _aux(96)
         self.motion_aux_head       = _aux(128)   # meaningful in video mode
+        self.format_aux_head       = _aux(96)
 
         self._init_weights()
 
@@ -1696,6 +1843,7 @@ class UnifiedFusionNet(nn.Module):
                 flow: torch.Tensor = None,
                 prnu_delta: torch.Tensor = None,
                 motion_feats: torch.Tensor = None,
+                format_feats: torch.Tensor = None,
                 mode: str = "image"):
         B  = img.size(0)
         _d = img.device
@@ -1733,6 +1881,8 @@ class UnifiedFusionNet(nn.Module):
         cmos_out         = _safe_branch(self.cmos_branch,        img,        out_dim=96,  B=B, device=_d, dtype=_t)
         color_incon_out  = _safe_branch(self.color_incon_branch, img,        out_dim=96,  B=B, device=_d, dtype=_t)
         flow_irr_out     = _safe_branch(self.flow_branch,        img,        out_dim=96,  B=B, device=_d, dtype=_t)
+        _fmt_in          = format_feats if format_feats is not None else _z(128)
+        format_out       = _safe_branch(self.format_branch,     _fmt_in,    out_dim=96,  B=B, device=_d, dtype=_t)
 
         # ── Video branches (zeros in image mode) ─────────────────────────
         if mode == "video" and flow is not None:
@@ -1754,6 +1904,7 @@ class UnifiedFusionNet(nn.Module):
                 cnn_out, srm_out, freq_out, color_out,
                 prnu_out, spatial_out, halluc_out, prnu_spatial_out,
                 gan_diff_out, cmos_out, color_incon_out, flow_irr_out,
+                format_out,
                 temporal_out, prnu_deep_out, prnu_temp_out, motion_out,
             ]
             branch_list = self.branch_gate(branch_list)
@@ -1784,6 +1935,7 @@ class UnifiedFusionNet(nn.Module):
                 _aux_safe(self.color_incon_aux_head,   color_incon_out,  "color_incon"),
                 _aux_safe(self.flow_aux_head,          flow_irr_out,     "flow"),
                 _aux_safe(self.motion_aux_head,        motion_out,       "motion"),
+                _aux_safe(self.format_aux_head,        format_out,       "format"),
             )
         return logit
 
@@ -1801,8 +1953,8 @@ class UnifiedFusionNet(nn.Module):
         print(
             "  UnifiedFusionNet v1  (B3 + SRM×15 + FFT×3 + YCbCr + PRNU-64 + SpatialCNN +\n"
             "    MobileNetV3 + PRNUSpatialMap + GAN/Diff + CMOS + ColorIncon + FlowIrreg +\n"
-            "    TemporalFlow + PRNUDeep + PRNUTemporal + MotionGRU +\n"
-            "    BranchGate-16 + CrossAttn-192×3×16 + INT8-ready)"
+            "    Format + TemporalFlow + PRNUDeep + PRNUTemporal + MotionGRU +\n"
+            "    BranchGate-17 + CrossAttn-192×5×17 + INT8-ready)"
         )
         print(f"  Total parameters    : {total:,}")
         print(f"  Trainable           : {trainable:,}  ({trainable/total*100:.1f}%)")

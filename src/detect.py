@@ -5,18 +5,20 @@ import sys
 import random
 import numpy as np
 from PIL import Image
+_BILINEAR = getattr(Image, 'Resampling', Image).BILINEAR  # Pillow 10+ compat
 
 import torch
 import torch.nn as nn
 from torchvision import transforms
 
 # Model definitions
-from model_prnu import DeepFusionNet, EfficientFusionNet, PRNUFusionNet, UnifiedFusionNet
+from model_prnu import DeepFusionNet, EfficientFusionNet, PRNUFusionNet, UnifiedFusionNet, check_checkpoint_compat
 from prnu import analyze_prnu, extract_noise_residual
 from prnu_features import extract_prnu_features, extract_prnu_features_fullres, extract_prnu_map
 from image_loader import UniversalImageLoader
 from prnu_recovery import build_prnu_recovery_net
 from prnu_cuda import PRNUExtractorGPU
+from format_analyzer import FormatAnalyzer
 
 # --- Configuration ---
 IMG_WIDTH  = 512
@@ -173,7 +175,7 @@ def compute_gradcam(
             cam_np = np.zeros_like(cam_np)
 
         cam_pil = Image.fromarray((cam_np * 255).astype(np.uint8))
-        cam_pil = cam_pil.resize((orig_width, orig_height), Image.BILINEAR)
+        cam_pil = cam_pil.resize((orig_width, orig_height), _BILINEAR)
         return np.array(cam_pil, dtype=np.float32) / 255.0
 
     finally:
@@ -270,6 +272,16 @@ class Detector:
             print(f"  PRNU recovery net unavailable: {e}")
             self.recovery_net = None
 
+        # --- Format analyzer (with restoration enabled for inference) ---
+        try:
+            self.format_analyzer = FormatAnalyzer(
+                recovery_net=self.recovery_net,
+                enable_restoration=True,
+            )
+        except Exception as e:
+            print(f"  FormatAnalyzer unavailable: {e}")
+            self.format_analyzer = None
+
         # --- GPU PRNU extractor (matches training path for consistency) ---
         self.prnu_gpu = None
         if self.device.type == 'cuda':
@@ -286,6 +298,7 @@ class Detector:
                 model = UnifiedFusionNet(prnu_in_features=64).to(self.device)
                 sd = torch.load(UNIFIED_MODEL_PATH, map_location=self.device,
                                 weights_only=True)
+                check_checkpoint_compat(model, sd.get('model_state_dict', sd))
                 model.load_state_dict(sd.get('model_state_dict', sd), strict=False)
                 model.eval()
                 self.model       = model
@@ -364,7 +377,7 @@ class Detector:
 
         orig_w, orig_h = img.size
         orig_array = np.array(
-            img.resize((min(orig_w, 1024), min(orig_h, 1024)), Image.BILINEAR)
+            img.resize((min(orig_w, 1024), min(orig_h, 1024)), _BILINEAR)
         )
 
         img_tensor = self.transform(img).unsqueeze(0).to(self.device)
@@ -411,10 +424,30 @@ class Detector:
             except Exception as e:
                 print(f"  PRNU spatial map extraction failed: {e}")
 
+        # --- Format forensics features ---
+        format_tensor     = None
+        format_forensics  = {"extraction_ok": False}
+        if self.format_analyzer is not None:
+            try:
+                ff = self.format_analyzer.analyze(image_data)
+                format_forensics = {
+                    "format":        ff.fmt_name,
+                    "media_type":    ff.media_type,
+                    "extraction_ok": ff.extraction_ok,
+                }
+                format_tensor = torch.from_numpy(ff.feature_vector).unsqueeze(0).float().to(self.device)
+            except Exception as _fe:
+                print(f"  Format analysis failed: {_fe}")
+
         # --- Inference ---
         with torch.no_grad():
             if self.use_fusion:
-                out    = self.model(img_tensor, prnu_tensor, prnu_map_tensor)
+                # Only UnifiedFusionNet accepts format_feats; DeepFusionNet does not
+                if isinstance(self.model, UnifiedFusionNet) and format_tensor is not None:
+                    out = self.model(img_tensor, prnu_tensor, prnu_map_tensor,
+                                     format_feats=format_tensor)
+                else:
+                    out = self.model(img_tensor, prnu_tensor, prnu_map_tensor)
                 logits = out[0] if isinstance(out, tuple) else out
                 ai_prob = float(torch.sigmoid(logits).item())
             else:
@@ -460,6 +493,7 @@ class Detector:
             "prnu_analysis":       prnu_analysis,
             "model_type":          self._model_type,
             "platform_compression": platform_info,
+            "format_forensics":    format_forensics,
         }
 
         # --- Grad-CAM heatmap ---

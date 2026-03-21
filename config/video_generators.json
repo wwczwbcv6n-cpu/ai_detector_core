@@ -1,0 +1,19 @@
+{
+  "itxio": {
+    "api_key_env":       "ITXIO_API_KEY",
+    "daily_limit":       null,
+    "base_url":          "https://api.ltx.video/v1",
+    "submit_endpoint":   "/text-to-video",
+    "auth_header":       "Authorization",
+    "auth_prefix":       "Bearer ",
+    "model":             "ltx-2-3-pro",
+    "resolution":        "1280x720",
+    "timeout_s":         300,
+    "submit_body": {
+      "prompt":     "{prompt}",
+      "model":      "ltx-2-3-pro",
+      "duration":   "{duration_s}",
+      "resolution": "1280x720"
+    }
+  }
+}

@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 from PIL import Image, ImageFilter
+_BILINEAR = getattr(Image, 'Resampling', Image).BILINEAR  # Pillow 10+ compat
 
 import torch
 import torch.nn as nn
@@ -54,13 +55,14 @@ DATA_DIR    = os.path.join(SCRIPT_DIR, '..', 'data')
 MODELS_DIR  = os.path.join(SCRIPT_DIR, '..', 'models')
 
 sys.path.insert(0, SCRIPT_DIR)
-from model_prnu import UnifiedFusionNet, DeepFusionNet, EfficientFusionNet
+from model_prnu import UnifiedFusionNet, DeepFusionNet, EfficientFusionNet, check_checkpoint_compat
 from prnu_features import extract_prnu_features_fullres, extract_prnu_map
 from prnu_cuda import PRNUExtractorGPU
 from prnu_recovery import (
     build_prnu_recovery_net, PRNURecoveryNet, train_recovery_net_one_step,
 )
 from live_plot import LivePlot
+from format_analyzer import FormatAnalyzer, get_shared_analyzer
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Constants
@@ -72,8 +74,10 @@ BATCH_REAL        = 32
 BATCH_AI          = 32
 INNER_EPOCHS      = 1
 GRAD_ACCUM_STEPS  = 8
-LOADER_BATCH_SIZE = 8       # effective batch = 64 on T4
+LOADER_BATCH_SIZE = 32      # 4× more GPU work per step — T4 VRAM easily handles this
 PRNU_TILE_SIZE    = 256     # reduced from 1024 — ~16x faster PRNU extraction
+
+FORMAT_FEATURE_DIM   = 128    # FormatForensicsBranch input dim
 
 LAMBDA_PRNU          = 0.35   # PRNU scalar features aux loss weight
 LAMBDA_HALLUC        = 0.15   # Hallucination aux loss weight
@@ -83,6 +87,7 @@ LAMBDA_CMOS          = 0.20   # CMOS/CCD sensor noise aux loss weight
 LAMBDA_COLOR_INCON   = 0.20   # Color channel inconsistency aux loss weight
 LAMBDA_FLOW          = 0.15   # Optical flow irregularity aux loss weight
 LAMBDA_MOTION        = 0.15   # MotionGRU temporal branch aux loss weight
+LAMBDA_FORMAT        = 0.20   # FormatForensicsBranch aux loss weight
 
 # Open Images metadata CSVs — primary (2018_04 with rotation data) + v7 fallback
 OI_VAL_CSV_URL   = ("https://storage.googleapis.com/openimages/2018_04/"
@@ -327,7 +332,7 @@ class CompressionAugment:
         w, h = img.size
         if max(w, h) > max_px:
             scale = max_px / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+            img = img.resize((int(w * scale), int(h * scale)), _BILINEAR)
         return img
 
 
@@ -447,6 +452,8 @@ class StreamBatchDataset(Dataset):
         self.recovery_net    = recovery_net
         self.device          = device
         self.prnu_extractor  = prnu_extractor  # PRNUExtractorGPU or None
+        # Format analyzer — enable_restoration=False for training speed
+        self._fmt_analyzer   = get_shared_analyzer(enable_restoration=False)
 
     def __len__(self):
         return len(self.paths)
@@ -493,6 +500,15 @@ class StreamBatchDataset(Dataset):
 
             prnu_map_t = torch.from_numpy(prnu_map_np.transpose(2, 0, 1)).float()
 
+        # Format forensics features (128-dim) — fast extraction, no restoration
+        try:
+            ff = self._fmt_analyzer.analyze(path)
+            fmt_feats = ff.feature_vector
+            if not np.isfinite(fmt_feats).all():
+                fmt_feats = np.zeros(FORMAT_FEATURE_DIM, dtype=np.float32)
+        except Exception:
+            fmt_feats = np.zeros(FORMAT_FEATURE_DIM, dtype=np.float32)
+
         # Visual transform for CNN input — asymmetric by label
         transform = self.ai_transform if label == 1 else self.real_transform
         if transform:
@@ -502,6 +518,7 @@ class StreamBatchDataset(Dataset):
             img,
             torch.from_numpy(prnu).float(),
             prnu_map_t,
+            torch.from_numpy(fmt_feats).float(),
             torch.tensor(label, dtype=torch.float32),
         )
 
@@ -602,14 +619,30 @@ def _download_image(url: str, dest_path: str, timeout: int = 20):
         return dest_path, False
 
 
-def download_batch(urls: list, dest_dir: str, max_workers: int = 8) -> list:
+def download_batch(urls: list, dest_dir: str, max_workers: int = 8,
+                   cookies_from_browser: str | None = None) -> list:
     os.makedirs(dest_dir, exist_ok=True)
+
+    # Local file paths — just copy them, no download needed
+    local_files = [u for u in urls if os.path.isfile(u)]
+    urls = [u for u in urls if not os.path.isfile(u)]
 
     # Split: video URLs (YouTube/Vimeo/etc.) vs direct image URLs
     video_urls = [u for u in urls if _is_video_url(u)]
     image_urls = [u for u in urls if not _is_video_url(u)]
 
     ok = []
+
+    # Copy local files directly — no download needed
+    for lp in local_files:
+        ext = os.path.splitext(lp)[1].lower()
+        if ext in _IMG_EXTS:
+            dest = os.path.join(dest_dir, f'lf_{abs(hash(lp)):08x}{ext}')
+            try:
+                shutil.copy2(lp, dest)
+                ok.append(dest)
+            except Exception:
+                pass
 
     # Download direct image URLs in parallel
     if image_urls:
@@ -629,7 +662,8 @@ def download_batch(urls: list, dest_dir: str, max_workers: int = 8) -> list:
     for i, url in enumerate(video_urls):
         frames = _download_video_frames(url, dest_dir,
                                         prefix=f'vid_{i:03d}',
-                                        max_frames=32)
+                                        max_frames=32,
+                                        cookies_from_browser=cookies_from_browser)
         ok.extend(frames)
 
     return ok
@@ -660,7 +694,8 @@ def _is_video_url(url: str) -> bool:
 def _download_video_frames(url: str, dest_dir: str,
                             prefix: str = 'vid',
                             max_frames: int = 32,
-                            fps_cap: float = 1.0) -> list:
+                            fps_cap: float = 1.0,
+                            cookies_from_browser: str | None = None) -> list:
     """
     Download a video from any yt-dlp-supported URL and extract up to
     `max_frames` evenly-spaced frames as JPEG images.
@@ -711,6 +746,8 @@ def _download_video_frames(url: str, dest_dir: str,
         'retries': 3,
         'merge_output_format': 'mp4',
     }
+    if cookies_from_browser:
+        ydl_opts['cookiesfrombrowser'] = (cookies_from_browser,)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -808,6 +845,7 @@ def load_or_init_model(device):
                 raw = torch.load(path, map_location=device)
             # Support both raw state-dict and {'model_state_dict': ...} formats
             state = raw.get('model_state_dict', raw) if isinstance(raw, dict) else raw
+            check_checkpoint_compat(model, state)
             missing, unexpected = model.load_state_dict(state, strict=False)
             print(f"  Loaded UnifiedFusionNet v1 from {path}  "
                   f"(missing={len(missing)}, unexpected={len(unexpected)})")
@@ -902,7 +940,13 @@ def train_one_batch(model, optimizer, scaler, loader, device,
         bar = loader   # graceful fallback if tqdm not installed
 
     use_amp   = (device.type == 'cuda')
-    criterion = nn.BCEWithLogitsLoss()
+    # Label smoothing ε=0.05: real label=0→0.025, AI label=1→0.975
+    # Prevents overconfidence, improves generalisation on unseen generators
+    _LS_EPS   = 0.05
+    _bce_raw  = nn.BCEWithLogitsLoss()
+    def criterion(logits, targets):
+        smooth = targets * (1 - _LS_EPS) + 0.5 * _LS_EPS
+        return _bce_raw(logits, smooth)
     trainable = [p for p in model.parameters() if p.requires_grad]
 
     model.train()
@@ -911,11 +955,12 @@ def train_one_batch(model, optimizer, scaler, loader, device,
     total        = 0
     optimizer.zero_grad()
 
-    for i, (imgs, prnu, prnu_map, labels) in enumerate(bar):
-        imgs     = imgs.to(device, non_blocking=True)
-        prnu     = prnu.to(device, non_blocking=True)
-        prnu_map = prnu_map.to(device, non_blocking=True)
-        labels   = labels.to(device, non_blocking=True).view(-1, 1)
+    for i, (imgs, prnu, prnu_map, fmt_feats, labels) in enumerate(bar):
+        imgs      = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        prnu      = prnu.to(device, non_blocking=True)
+        prnu_map  = prnu_map.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        fmt_feats = fmt_feats.to(device, non_blocking=True)
+        labels    = labels.to(device, non_blocking=True).view(-1, 1)
 
         # GPU PRNU extraction — replaces placeholder zeros from DataLoader workers
         if prnu_gpu is not None:
@@ -934,12 +979,13 @@ def train_one_batch(model, optimizer, scaler, loader, device,
 
         try:
             with torch.amp.autocast(device.type, enabled=use_amp):
-                out = model(imgs, prnu, prnu_map)
+                out = model(imgs, prnu, prnu_map, format_feats=fmt_feats)
                 if isinstance(out, tuple):
-                    # UnifiedFusionNet returns 9 outputs:
-                    # (logit, prnu, halluc, prnu_spatial, gan_diff, cmos, color_incon, flow, motion)
+                    # UnifiedFusionNet returns 10 outputs:
+                    # (logit, prnu, halluc, prnu_spatial, gan_diff, cmos, color_incon, flow, motion, format)
                     (logits, prnu_aux, halluc_aux, prnu_spatial_aux,
-                     gan_diff_aux, cmos_aux, color_incon_aux, flow_aux, motion_aux) = out
+                     gan_diff_aux, cmos_aux, color_incon_aux, flow_aux,
+                     motion_aux, format_aux) = out[:10]
                     loss = (
                         criterion(logits,           labels)
                         + LAMBDA_PRNU         * criterion(prnu_aux,         labels)
@@ -950,6 +996,7 @@ def train_one_batch(model, optimizer, scaler, loader, device,
                         + LAMBDA_COLOR_INCON  * criterion(color_incon_aux,  labels)
                         + LAMBDA_FLOW         * criterion(flow_aux,         labels)
                         + LAMBDA_MOTION       * criterion(motion_aux,       labels)
+                        + LAMBDA_FORMAT       * criterion(format_aux,       labels)
                     ) / accum_steps
                 else:
                     logits = out
@@ -989,7 +1036,7 @@ def train_one_batch(model, optimizer, scaler, loader, device,
                 refresh=False,
             )
 
-        del imgs, prnu, prnu_map, labels, out, logits, loss
+        del imgs, prnu, prnu_map, fmt_feats, labels, out, logits, loss
 
     # Flush remaining gradients
     if len(loader) % accum_steps != 0:
@@ -1022,11 +1069,12 @@ def eval_one_batch(model, loader, device, prnu_gpu=None) -> tuple:
     total        = 0
 
     with torch.no_grad():
-        for imgs, prnu, prnu_map, labels in bar:
-            imgs     = imgs.to(device, non_blocking=True)
-            prnu     = prnu.to(device, non_blocking=True)
-            prnu_map = prnu_map.to(device, non_blocking=True)
-            labels   = labels.to(device, non_blocking=True).view(-1, 1)
+        for imgs, prnu, prnu_map, fmt_feats, labels in bar:
+            imgs      = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            prnu      = prnu.to(device, non_blocking=True)
+            prnu_map  = prnu_map.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            fmt_feats = fmt_feats.to(device, non_blocking=True)
+            labels    = labels.to(device, non_blocking=True).view(-1, 1)
 
             # GPU PRNU extraction for val batch
             if prnu_gpu is not None:
@@ -1043,7 +1091,7 @@ def eval_one_batch(model, loader, device, prnu_gpu=None) -> tuple:
 
             try:
                 with torch.amp.autocast(device.type, enabled=use_amp):
-                    out    = model(imgs, prnu, prnu_map)
+                    out    = model(imgs, prnu, prnu_map, format_feats=fmt_feats)
                     logits = out[0] if isinstance(out, tuple) else out
                     loss   = criterion(logits, labels)
             except Exception as _val_exc:
@@ -1098,6 +1146,9 @@ def main():
     parser.add_argument('--no_plot',      dest='plot', action='store_false')
     parser.add_argument('--no_recovery',  action='store_true',
                         help='Disable PRNU recovery net (faster, less accurate)')
+    parser.add_argument('--cookies_from_browser', type=str, default=None,
+                        help='Pass browser cookies to yt-dlp for authenticated downloads '
+                             '(e.g. "chrome", "firefox", "chromium"). Required for YouTube.')
     args = parser.parse_args()
 
     # Colab/Jupyter guard: forked workers cause CUDA context errors in notebooks
@@ -1135,6 +1186,42 @@ def main():
         print("ERROR: URL list is empty. Cannot train.")
         sys.exit(1)
 
+    # ── Pre-download ALL external source files at startup ────────────────
+    # When --url_file is given, download every URL (image + video) once into
+    # data/real_url_frames/ at startup.  Training then runs exactly ONE pass
+    # over the downloaded files and stops — no looping, no per-batch downloads.
+    external_source = False
+    if args.url_file:
+        real_cache_dir = os.path.join(DATA_DIR, 'real_url_frames')
+        os.makedirs(real_cache_dir, exist_ok=True)
+        existing = sorted([
+            os.path.join(real_cache_dir, f)
+            for f in os.listdir(real_cache_dir)
+            if os.path.splitext(f)[1].lower() in _IMG_EXTS
+        ])
+        if existing:
+            print(f"\n[1b/5] {len(existing)} frames already cached in {real_cache_dir}")
+            urls = existing
+        else:
+            print(f"\n[1b/5] Downloading all {len(urls)} URL(s) → {real_cache_dir} ...")
+            urls = download_batch(
+                urls, real_cache_dir,
+                max_workers=args.max_workers,
+                cookies_from_browser=args.cookies_from_browser,
+            )
+            print(f"  → {len(urls)} frames cached")
+        if not urls:
+            print("ERROR: No frames downloaded from --url_file. Exiting.")
+            sys.exit(1)
+        # One-pass: train exactly once over all downloaded frames then stop
+        one_pass_batches = max(1, -(-len(urls) // args.batch_real))  # ceil
+        if args.total_batches != one_pass_batches:
+            print(f"  --url_file mode: total_batches = {one_pass_batches} "
+                  f"(one pass over {len(urls)} frames, batch_real={args.batch_real})")
+            args.total_batches = one_pass_batches
+        external_source = True
+        random.shuffle(urls)  # shuffle once upfront, never wrap
+
     # ── Load AI image pool ────────────────────────────────────────────────
     print("\n[2/5] Scanning local AI image pool ...")
     ai_paths = load_ai_image_paths()
@@ -1147,7 +1234,8 @@ def main():
         print(f"  → {len(ai_urls)} AI URLs. Downloading frames...")
         ai_dl_dir = os.path.join(DATA_DIR, 'ai_url_frames')
         os.makedirs(ai_dl_dir, exist_ok=True)
-        downloaded = download_batch(ai_urls, ai_dl_dir, max_workers=args.max_workers)
+        downloaded = download_batch(ai_urls, ai_dl_dir, max_workers=args.max_workers,
+                                    cookies_from_browser=args.cookies_from_browser)
         ai_paths.extend(downloaded)
         print(f"  → {len(downloaded)} AI frames downloaded → total AI pool: {len(ai_paths)}")
 
@@ -1156,8 +1244,29 @@ def main():
     model = load_or_init_model(device)
     model.param_summary()
 
+    # channels_last: conv-heavy EfficientNet backbone runs 10-20% faster on CUDA
+    if device.type == 'cuda':
+        model = model.to(memory_format=torch.channels_last)
+        print("  channels_last memory format: enabled")
+
+    # torch.compile: 20-40% faster forward/backward with no quality loss
+    if device.type == 'cuda' and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode='reduce-overhead', fullgraph=False)
+            print("  torch.compile: enabled (reduce-overhead mode)")
+        except Exception as _ce:
+            print(f"  torch.compile: skipped ({_ce})")
+
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+    # Fused AdamW: single CUDA kernel for param update — ~5-10% faster on GPU
+    _fused_ok = device.type == 'cuda'
+    try:
+        optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4,
+                                fused=_fused_ok)
+        if _fused_ok:
+            print("  Fused AdamW: enabled")
+    except TypeError:
+        optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
     scaler    = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     # ── GPU PRNU extractor (CuPy-backed, replaces slow CPU path) ──────────
@@ -1221,6 +1330,15 @@ def main():
     #  Prefetch helper
     # ══════════════════════════════════════════════════════════════════════
     def _prefetch(batch_num, offset):
+        # ── External source: files already local, return slice directly ──
+        if external_source:
+            end         = min(offset + args.batch_real, len(urls))
+            batch_files = urls[offset:end]
+            print(f"  [prefetch] batch {batch_num}: {len(batch_files)} local frames "
+                  f"(offset {offset}–{end})")
+            return batch_files, None, end   # temp_dir=None — nothing to delete
+
+        # ── Streaming source: download a fresh batch ──────────────────────
         end        = offset + args.batch_real
         batch_urls = urls[offset:end]
         if not batch_urls:
@@ -1229,7 +1347,8 @@ def main():
             end        = args.batch_real
         tdir = os.path.join(CACHE_DIR, f'batch_{batch_num:06d}')
         t0   = time.time()
-        rp   = download_batch(batch_urls, tdir, max_workers=args.max_workers)
+        rp   = download_batch(batch_urls, tdir, max_workers=args.max_workers,
+                              cookies_from_browser=args.cookies_from_browser)
         dt   = time.time() - t0
         print(f"  [prefetch] batch {batch_num}: {len(rp)}/{len(batch_urls)} images in {dt:.1f}s")
         return rp, tdir, end
@@ -1251,13 +1370,21 @@ def main():
 
             if len(real_paths) < args.min_real:
                 print(f"  Only {len(real_paths)} images (min {args.min_real}). Skipping.")
-                if os.path.isdir(temp_dir):
+                if temp_dir and os.path.isdir(temp_dir):
                     shutil.rmtree(temp_dir, ignore_errors=True)
-                prefetch_future = pool.submit(_prefetch, batch_num, url_offset)
+                # External source: no wrap — advance offset and let the loop end naturally
+                next_skip_offset = url_offset if (not external_source and url_offset < len(urls)) else url_offset
+                if not external_source and url_offset >= len(urls):
+                    next_skip_offset = 0
+                prefetch_future = pool.submit(_prefetch, batch_num, next_skip_offset)
                 continue
 
             if batch_num < args.total_batches:
-                next_offset     = url_offset if url_offset < len(urls) else 0
+                # External source: never wrap past end of data
+                if external_source:
+                    next_offset = url_offset
+                else:
+                    next_offset = url_offset if url_offset < len(urls) else 0
                 prefetch_future = pool.submit(_prefetch, batch_num + 1, next_offset)
 
             # ── Save monitor images ────────────────────────────────────
@@ -1346,9 +1473,9 @@ def main():
                         consecutive_bad = 0
 
             finally:
-                if os.path.isdir(temp_dir):
+                if temp_dir and os.path.isdir(temp_dir):
                     shutil.rmtree(temp_dir, ignore_errors=True)
-                print(f"  Deleted {temp_dir}")
+                    print(f"  Deleted {temp_dir}")
 
             # ── Joint recovery net training (every 5 batches) ─────────
             if (recovery_net is not None and recovery_optimizer is not None
@@ -1359,7 +1486,7 @@ def main():
                     for p in train_real[:min(4, len(train_real))]:
                         try:
                             img = Image.open(p).convert('RGB').resize(
-                                (IMG_SIZE, IMG_SIZE), Image.BILINEAR
+                                (IMG_SIZE, IMG_SIZE), _BILINEAR
                             )
                             arr = np.array(img, dtype=np.float32) / 255.0
                             clean_imgs.append(arr.transpose(2, 0, 1))
@@ -1415,6 +1542,12 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     #  Final save
     # ══════════════════════════════════════════════════════════════════════
+    if external_source:
+        print(f"\n{'='*60}")
+        print(f"  Training complete — one full pass over external source data.")
+        print(f"  {batches_done} batches | {total_real_seen:,} real frames seen")
+        print(f"{'='*60}")
+
     if live_plot:
         live_plot.close()
 

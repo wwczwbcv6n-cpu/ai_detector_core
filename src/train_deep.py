@@ -53,6 +53,7 @@ import time
 import cv2
 import numpy as np
 from PIL import Image, ImageFilter, ImageEnhance
+_BILINEAR = getattr(Image, 'Resampling', Image).BILINEAR  # Pillow 10+ compat
 
 # ── PyTorch (imported after memory check) ────────────────────────────────────
 import torch
@@ -65,7 +66,7 @@ from torchvision import transforms
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from model_prnu import UnifiedFusionNet
+from model_prnu import UnifiedFusionNet, check_checkpoint_compat
 from live_plot import LivePlot
 from training_dashboard import TrainingDashboard
 from prnu_features import (
@@ -75,6 +76,19 @@ from prnu_features import (
     PRNU_FAST_DIM,
     PRNU_FULLRES_DIM,
 )
+from format_analyzer import FormatAnalyzer, get_shared_analyzer
+from motion_analyzer import extract_pair_features, MOTION_FEATURE_DIM
+
+FORMAT_FEATURE_DIM   = 128   # FormatForensicsBranch input dim
+LAMBDA_PRNU          = 0.35  # aux loss weights — must match train_streaming.py
+LAMBDA_HALLUC        = 0.15
+LAMBDA_PRNU_SPATIAL  = 0.20
+LAMBDA_GAN_DIFF      = 0.25
+LAMBDA_CMOS          = 0.20
+LAMBDA_COLOR_INCON   = 0.20
+LAMBDA_FLOW          = 0.15
+LAMBDA_MOTION        = 0.15
+LAMBDA_FORMAT        = 0.20
 
 # ── C++ Hardware Acceleration ────────────────────────────────────────────────
 try:
@@ -445,8 +459,8 @@ class VideoCompressionAugment:
             w, h = pil_img.size
             scale = random.uniform(0.6, 0.85)
             pil_img = pil_img.resize(
-                (max(32, int(w * scale)), max(32, int(h * scale))), Image.BILINEAR
-            ).resize((w, h), Image.BILINEAR)
+                (max(32, int(w * scale)), max(32, int(h * scale))), _BILINEAR
+            ).resize((w, h), _BILINEAR)
 
         buf = io.BytesIO()
         pil_img.save(buf, format='JPEG', quality=quality)
@@ -474,13 +488,15 @@ _VIDEO_COMPRESSION_AUG = VideoCompressionAugment()
 class ImageDataset(Dataset):
     """
     Dataset for image training.
-    Returns (img_tensor, prnu_64_tensor, prnu_map_tensor, label_tensor).
+    Returns (img_tensor, prnu_64_tensor, prnu_map_tensor, fmt_feats_tensor, label_tensor).
     PRNU scalar features are 64-dim (v6 fullres); prnu_map is (3,128,128).
+    fmt_feats is 128-dim format forensics vector.
     """
     def __init__(self, image_paths, labels, transform=None):
-        self.image_paths = image_paths
-        self.labels      = labels
-        self.transform   = transform
+        self.image_paths  = image_paths
+        self.labels       = labels
+        self.transform    = transform
+        self._fmt_analyzer = get_shared_analyzer(enable_restoration=False)
 
     def __len__(self):
         return len(self.image_paths)
@@ -498,7 +514,7 @@ class ImageDataset(Dataset):
 
         # ── Full-res PRNU scalar features (64-dim v6) ──
         try:
-            prnu_input = image.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR) \
+            prnu_input = image.resize((IMG_SIZE, IMG_SIZE), _BILINEAR) \
                          if max(image.size) > IMG_SIZE * 2 else image
             arr = np.array(prnu_input, dtype=np.float64) / 255.0
             prnu_feats = extract_prnu_features_fullres(arr, tile_size=128)
@@ -517,6 +533,15 @@ class ImageDataset(Dataset):
             prnu_map_np = np.zeros((128, 128, 3), dtype=np.float32)
         prnu_map_t = torch.from_numpy(prnu_map_np.transpose(2, 0, 1)).float()
 
+        # ── Format forensics features (128-dim) ──
+        try:
+            ff = self._fmt_analyzer.analyze(img_path)
+            fmt_feats = ff.feature_vector
+            if not np.isfinite(fmt_feats).all():
+                fmt_feats = np.zeros(FORMAT_FEATURE_DIM, dtype=np.float32)
+        except Exception:
+            fmt_feats = np.zeros(FORMAT_FEATURE_DIM, dtype=np.float32)
+
         if self.transform:
             image = self.transform(image)
 
@@ -524,6 +549,7 @@ class ImageDataset(Dataset):
             image,
             torch.from_numpy(prnu_feats).float(),
             prnu_map_t,
+            torch.from_numpy(fmt_feats).float(),
             torch.tensor(label, dtype=torch.float32),
         )
 
@@ -590,7 +616,7 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
     print("\n")
     print("=" * 66)
     print("    SECTION A ─ IMAGE TRAINING")
-    print("    Model : UnifiedFusionNet v1  (16-branch, 64-dim PRNU, image mode)")
+    print("    Model : UnifiedFusionNet v1  (17-branch, 64-dim PRNU, image mode)")
     print("=" * 66)
 
     # ── Data ──
@@ -656,31 +682,32 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
         run_loss, correct, total = 0.0, 0, 0
         optimizer.zero_grad()
 
-        for i, (imgs, prnu_feats, prnu_maps, targets) in enumerate(train_dl):
+        for i, (imgs, prnu_feats, prnu_maps, fmt_feats, targets) in enumerate(train_dl):
             imgs       = imgs.to(device)
             prnu_feats = prnu_feats.to(device)
             prnu_maps  = prnu_maps.to(device)
+            fmt_feats  = fmt_feats.to(device)
             targets    = targets.to(device).view(-1, 1)
 
             try:
                 with torch.amp.autocast(device.type, enabled=use_amp):
-                    out = model(imgs, prnu_feats, prnu_maps)
+                    out = model(imgs, prnu_feats, prnu_maps, format_feats=fmt_feats)
                     if isinstance(out, tuple):
                         (logits, prnu_aux, halluc_aux, prnu_sp_aux,
-                         gan_aux, cmos_aux, col_aux, flow_aux, *rest) = out
+                         gan_aux, cmos_aux, col_aux, flow_aux,
+                         motion_aux, format_aux) = out[:10]
                         loss = (
-                            criterion(logits,      targets)
-                            + 0.35 * criterion(prnu_aux,   targets)
-                            + 0.15 * criterion(halluc_aux, targets)
-                            + 0.20 * criterion(prnu_sp_aux,targets)
-                            + 0.25 * criterion(gan_aux,    targets)
-                            + 0.20 * criterion(cmos_aux,   targets)
-                            + 0.20 * criterion(col_aux,    targets)
-                            + 0.15 * criterion(flow_aux,   targets)
-                        )
-                        if rest:   # motion aux head in video mode
-                            loss = loss + 0.15 * criterion(rest[0], targets)
-                        loss = loss / grad_accum
+                            criterion(logits,        targets)
+                            + LAMBDA_PRNU         * criterion(prnu_aux,    targets)
+                            + LAMBDA_HALLUC       * criterion(halluc_aux,  targets)
+                            + LAMBDA_PRNU_SPATIAL * criterion(prnu_sp_aux, targets)
+                            + LAMBDA_GAN_DIFF     * criterion(gan_aux,     targets)
+                            + LAMBDA_CMOS         * criterion(cmos_aux,    targets)
+                            + LAMBDA_COLOR_INCON  * criterion(col_aux,     targets)
+                            + LAMBDA_FLOW         * criterion(flow_aux,    targets)
+                            + LAMBDA_MOTION       * criterion(motion_aux,  targets)
+                            + LAMBDA_FORMAT       * criterion(format_aux,  targets)
+                        ) / grad_accum
                     else:
                         logits = out
                         loss   = criterion(logits, targets) / grad_accum
@@ -709,7 +736,7 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
             total += targets.size(0)
             correct += (preds == targets).sum().item()
 
-            del imgs, prnu_feats, prnu_maps, targets, out, logits, loss
+            del imgs, prnu_feats, prnu_maps, fmt_feats, targets, out, logits, loss
 
             if (i + 1) % 50 == 0:
                 ResourceGuard.check_or_abort(model, f"E{epoch+1} B{i+1}", IMAGE_MODEL_PATH)
@@ -731,13 +758,14 @@ def train_image_section(image_data_dir=None, epochs=IMG_EPOCHS,
         model.eval()
         v_loss, v_correct, v_total = 0.0, 0, 0
         with torch.no_grad():
-            for imgs, prnu_feats, prnu_maps, targets in val_dl:
+            for imgs, prnu_feats, prnu_maps, fmt_feats, targets in val_dl:
                 imgs       = imgs.to(device)
                 prnu_feats = prnu_feats.to(device)
                 prnu_maps  = prnu_maps.to(device)
+                fmt_feats  = fmt_feats.to(device)
                 targets    = targets.to(device).view(-1, 1)
                 try:
-                    out    = model(imgs, prnu_feats, prnu_maps)
+                    out    = model(imgs, prnu_feats, prnu_maps, format_feats=fmt_feats)
                     logits = out[0] if isinstance(out, tuple) else out
                     v_loss    += criterion(logits, targets).item() * imgs.size(0)
                     preds = (torch.sigmoid(logits) > 0.5).float()
@@ -974,10 +1002,11 @@ class VideoDeepDataset(IterableDataset):
                 print(f"  [warn] Audio extraction failed for {video_path}: {e}")
                 if os.path.exists(temp_wav): os.remove(temp_wav)
 
-        frame_idx       = 0
-        prev_bgr        = None
-        prev_frame_prnu = None   # 16-dim PRNU of previous sampled frame
-        prev_flow_mag   = None   # (flow_size, flow_size) magnitude channel of prev flow
+        frame_idx           = 0
+        prev_bgr            = None
+        prev_frame_prnu     = None   # PRNU of previous sampled frame
+        prev_flow_mag       = None   # magnitude channel of prev flow (for 6-ch flow)
+        prev_motion_mean_mag = None  # mean flow magnitude of prev pair (for motion_analyzer)
         vname           = os.path.basename(video_path)
 
         print(f"\n  📹  {vname}  [{w}×{h} @ {cam_fps:.0f}fps]  "
@@ -1053,6 +1082,20 @@ class VideoDeepDataset(IterableDataset):
                         flow_delta_norm[:, :, np.newaxis],
                     ], axis=-1).astype(np.float32)
 
+                    # ── Motion features (48-dim) for MotionTemporalBranch ──
+                    if prev_bgr is not None:
+                        try:
+                            motion_feats_np = extract_pair_features(
+                                prev_bgr, bgr, prev_motion_mean_mag
+                            )
+                            prev_motion_mean_mag = float(motion_feats_np[0])
+                        except Exception:
+                            motion_feats_np = np.zeros(MOTION_FEATURE_DIM, dtype=np.float32)
+                    else:
+                        motion_feats_np = np.zeros(MOTION_FEATURE_DIM, dtype=np.float32)
+                    # Shape (1, 48) — single time step; MotionTemporalBranch handles T≥1
+                    motion_feat_t = torch.from_numpy(motion_feats_np).unsqueeze(0).float()
+
                     # ── Frame-level PRNU for temporal drift signal ─────────
                     # Downsample to 256×256 for speed, then extract 16-dim PRNU
                     small_rgb = cv2.resize(rgb, (256, 256))
@@ -1108,7 +1151,7 @@ class VideoDeepDataset(IterableDataset):
                         flow_t = torch.from_numpy(flow_tile)  # (6,H,W)
                         prnu_t = torch.from_numpy(prnu)
 
-                        yield img_t, flow_t, prnu_t, prnu_delta_t, audio_t, torch.tensor(label)
+                        yield img_t, flow_t, prnu_t, prnu_delta_t, audio_t, motion_feat_t, torch.tensor(label)
 
                     # ── Yield AI-edited tiles (real videos only) ──
                     if label != 0.0:
@@ -1150,12 +1193,15 @@ class VideoDeepDataset(IterableDataset):
                             prnu_t         = torch.from_numpy(prnu)
                             ai_prnu_delta_t = torch.from_numpy(ai_prnu_delta)
 
+                            # AI tiles: zeros for motion — no real camera shake
                             yield (img_t, flow_t, prnu_t, ai_prnu_delta_t,
-                                   fake_audio_t, torch.tensor(1.0))        # 1=AI
+                                   fake_audio_t,
+                                   torch.zeros(1, MOTION_FEATURE_DIM),
+                                   torch.tensor(1.0))        # 1=AI
 
-                    prev_bgr        = bgr.copy()
-                    prev_frame_prnu = frame_prnu.copy()
-                    prev_flow_mag   = mag_ch.copy()
+                    prev_bgr             = bgr.copy()
+                    prev_frame_prnu      = frame_prnu.copy()
+                    prev_flow_mag        = mag_ch.copy()
                     print(".", end="", flush=True)
 
                 frame_idx += 1
@@ -1199,6 +1245,7 @@ def _load_checkpoint(model, optimizer, path):
     except Exception:
         ckpt = torch.load(path, map_location=device)
     try:
+        check_checkpoint_compat(model, ckpt.get('model_state', ckpt))
         missing, unexpected = model.load_state_dict(ckpt['model_state'], strict=False)
         # If too many keys mismatch the checkpoint is from a different architecture
         # — discard it and start fresh rather than training on broken weights.
@@ -1241,7 +1288,7 @@ def train_video_section(
     print("\n")
     print("=" * 66)
     print("    SECTION B ─ VIDEO TRAINING  (4K · 120 FPS · Deep PRNU)")
-    print(f"    Model : UnifiedFusionNet v1  (16-branch, 64-dim PRNU, video mode)")
+    print(f"    Model : UnifiedFusionNet v1  (17-branch, 64-dim PRNU, video mode)")
     print(f"    Dir   : {video_dir}")
     print(f"    Tile  : {tile_size}×{tile_size} px  |  "
           f"FPS sample: {fps_sample}  |  AI variants: {VID_EDITS_PER_FRAME}")
@@ -1308,11 +1355,12 @@ def train_video_section(
 
         print(f"\n  ─── Epoch {epoch+1}/{epochs} ───")
 
-        for imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets in loader:
-            imgs        = imgs.to(device, non_blocking=True)
-            flows       = flows.to(device, non_blocking=True)
-            prnu_feats  = prnu_feats.to(device, non_blocking=True)
-            prnu_deltas = prnu_deltas.to(device, non_blocking=True)
+        for imgs, flows, prnu_feats, prnu_deltas, audio_ts, motion_feats, targets in loader:
+            imgs          = imgs.to(device, non_blocking=True)
+            flows         = flows.to(device, non_blocking=True)
+            prnu_feats    = prnu_feats.to(device, non_blocking=True)
+            prnu_deltas   = prnu_deltas.to(device, non_blocking=True)
+            motion_feats  = motion_feats.to(device, non_blocking=True)
             if use_audio and audio_ts[0] is not None:
                 audio_ts = audio_ts.to(device, non_blocking=True)
             else:
@@ -1321,13 +1369,25 @@ def train_video_section(
 
             try:
                 with torch.amp.autocast(device.type, enabled=use_amp):
-                    out = model(imgs, prnu_feats, None, flows, prnu_deltas, mode="video")
+                    out = model(imgs, prnu_feats, prnu_map=None, flow=flows,
+                                prnu_delta=prnu_deltas, motion_feats=motion_feats,
+                                format_feats=None, mode="video")
                     if isinstance(out, tuple):
-                        logits = out[0]
-                        loss = criterion(logits, targets)
-                        for aux in out[1:]:
-                            loss = loss + 0.2 * criterion(aux, targets)
-                        loss = loss / grad_accum
+                        (logits, prnu_aux, halluc_aux, prnu_sp_aux,
+                         gan_aux, cmos_aux, col_aux, flow_aux,
+                         motion_aux, format_aux) = out[:10]
+                        loss = (
+                            criterion(logits,        targets)
+                            + LAMBDA_PRNU         * criterion(prnu_aux,    targets)
+                            + LAMBDA_HALLUC       * criterion(halluc_aux,  targets)
+                            + LAMBDA_PRNU_SPATIAL * criterion(prnu_sp_aux, targets)
+                            + LAMBDA_GAN_DIFF     * criterion(gan_aux,     targets)
+                            + LAMBDA_CMOS         * criterion(cmos_aux,    targets)
+                            + LAMBDA_COLOR_INCON  * criterion(col_aux,     targets)
+                            + LAMBDA_FLOW         * criterion(flow_aux,    targets)
+                            + LAMBDA_MOTION       * criterion(motion_aux,  targets)
+                            + LAMBDA_FORMAT       * criterion(format_aux,  targets)
+                        ) / grad_accum
                     else:
                         logits = out
                         loss = criterion(logits, targets) / grad_accum
@@ -1335,12 +1395,12 @@ def train_video_section(
                 print(f"  ⚠️  WARNING: video train forward failed at step {step+1} "
                       f"({type(_fwd_exc).__name__}: {_fwd_exc}). Skipping.")
                 optimizer.zero_grad()
-                del imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets
+                del imgs, flows, prnu_feats, prnu_deltas, audio_ts, motion_feats, targets
                 continue
 
             if torch.isnan(loss):
                 optimizer.zero_grad()
-                del imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets, out, logits, loss
+                del imgs, flows, prnu_feats, prnu_deltas, audio_ts, motion_feats, targets, out, logits, loss
                 continue
 
             scaler.scale(loss).backward()
@@ -1374,7 +1434,7 @@ def train_video_section(
                 except Exception:
                     pass
 
-            del imgs, flows, prnu_feats, prnu_deltas, audio_ts, targets, out, logits, loss
+            del imgs, flows, prnu_feats, prnu_deltas, audio_ts, motion_feats, targets, out, logits, loss
 
             # Progress every 10 optimizer steps
             if step % (grad_accum * 10) == 0 and total > 0:
@@ -1565,37 +1625,47 @@ def interactive_main():
 
                     print(f"\n  {len(youtube_urls)} URL(s) queued.")
 
+                    # ── Phase 1: Download ALL videos first ────────────────
+                    real_videos_dir = os.path.join(DATA_DIR, 'real_videos')
+                    os.makedirs(real_videos_dir, exist_ok=True)
+                    print(f"\n  Phase 1 — Downloading {len(youtube_urls)} video(s)")
+                    print(f"  Destination: {real_videos_dir}")
+                    downloaded_paths = []
                     for url_idx, yt_url in enumerate(youtube_urls, 1):
-                        print(f"\n{'='*60}")
-                        print(f"  VIDEO {url_idx}/{len(youtube_urls)}: {yt_url}")
-                        print(f"{'='*60}")
-                        temp_video_path = None
+                        print(f"\n[{url_idx}/{len(youtube_urls)}] {yt_url}")
                         try:
-                            temp_video_path = _download_youtube_video(
-                                yt_url, section_minutes=section_minutes
+                            path = _download_youtube_video(
+                                yt_url,
+                                output_dir=real_videos_dir,
+                                section_minutes=section_minutes,
                             )
+                            if path and os.path.exists(path):
+                                downloaded_paths.append(path)
+                                print(f"  Saved: {path}")
                         except Exception as exc:
                             print(f"  [ERROR] Download failed: {exc}. Skipping.")
-                            continue
-                        try:
-                            train_video_section(
-                                video_dir               = TEMP_FRAMES,
-                                epochs                  = epochs,
-                                batch_size              = VID_BATCH,
-                                lr                      = VID_LR,
-                                tile_size               = VID_TILE_SIZE,
-                                fps_sample              = fps_sample,
-                                checkpoint_interval_min = CKPT_INTERVAL_MIN,
-                                resume_path             = VIDEO_CKPT_PATH,
-                                use_audio               = use_audio,
-                                ai_video_dir            = ai_video_dir,
-                            )
-                        finally:
-                            if temp_video_path and os.path.exists(temp_video_path):
-                                os.remove(temp_video_path)
-                                print(f"  Removed temp file: {temp_video_path}")
 
-                    print(f"\n  Batch complete — {len(youtube_urls)} video(s) trained.")
+                    if not downloaded_paths:
+                        print("  No videos downloaded. Skipping training.")
+                        continue
+
+                    print(f"\n  {len(downloaded_paths)}/{len(youtube_urls)} video(s) ready.")
+
+                    # ── Phase 2: Train ONCE on all videos together ────────
+                    print(f"\n  Phase 2 — Training on all {len(downloaded_paths)} video(s)...")
+                    train_video_section(
+                        video_dir               = real_videos_dir,
+                        epochs                  = epochs,
+                        batch_size              = VID_BATCH,
+                        lr                      = VID_LR,
+                        tile_size               = VID_TILE_SIZE,
+                        fps_sample              = fps_sample,
+                        checkpoint_interval_min = CKPT_INTERVAL_MIN,
+                        resume_path             = VIDEO_CKPT_PATH,
+                        use_audio               = use_audio,
+                        ai_video_dir            = ai_video_dir,
+                    )
+                    print(f"\n  Training complete — {len(downloaded_paths)} video(s) trained.")
                     break
                 else:
                     default_vid_dir = os.path.join(DATA_DIR, 'real_videos')
@@ -1717,36 +1787,54 @@ def main():
 
     if args.youtube:
         section_minutes = None if args.minutes == 0 else args.minutes
-        ai_video_dir    = os.path.join(DATA_DIR, 'ai_videos')
-        ai_video_dir    = ai_video_dir if os.path.isdir(ai_video_dir) else None
+        real_videos_dir = os.path.join(DATA_DIR, 'real_videos')
+        os.makedirs(real_videos_dir, exist_ok=True)
 
+        # ── Phase 1: Download ALL videos first ───────────────────────────
+        print(f"\n{'='*60}")
+        print(f"  Phase 1 — Downloading {len(args.youtube)} video(s)")
+        print(f"  Destination: {real_videos_dir}")
+        print(f"{'='*60}")
+        downloaded = []
         for idx, yt_url in enumerate(args.youtube, 1):
-            print(f"\n{'='*60}")
-            print(f"  VIDEO {idx}/{len(args.youtube)}: {yt_url}")
-            print(f"{'='*60}")
-            temp_path = None
+            print(f"\n[{idx}/{len(args.youtube)}] {yt_url}")
             try:
-                temp_path = _download_youtube_video(
-                    yt_url, section_minutes=section_minutes
+                path = _download_youtube_video(
+                    yt_url,
+                    output_dir=real_videos_dir,
+                    section_minutes=section_minutes,
                 )
-                train_video_section(
-                    video_dir               = TEMP_FRAMES,
-                    epochs                  = args.epochs,
-                    batch_size              = VID_BATCH,
-                    lr                      = VID_LR,
-                    tile_size               = VID_TILE_SIZE,
-                    fps_sample              = args.fps,
-                    checkpoint_interval_min = CKPT_INTERVAL_MIN,
-                    resume_path             = VIDEO_CKPT_PATH,
-                    use_audio               = False,
-                    ai_video_dir            = ai_video_dir,
-                )
+                if path and os.path.exists(path):
+                    downloaded.append(path)
+                    print(f"  Saved: {path}")
             except Exception as exc:
-                print(f"  [ERROR] {exc}")
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-                    print(f"  Deleted: {temp_path}")
+                print(f"  [ERROR] Download failed: {exc}")
+
+        if not downloaded:
+            print("\nNo videos downloaded successfully. Exiting.")
+            return
+
+        print(f"\n  {len(downloaded)}/{len(args.youtube)} video(s) ready in {real_videos_dir}")
+
+        # ── Phase 2: Train ONCE on all downloaded videos ─────────────────
+        print(f"\n{'='*60}")
+        print(f"  Phase 2 — Training on all {len(downloaded)} video(s)")
+        print(f"{'='*60}")
+        ai_video_dir = os.path.join(DATA_DIR, 'ai_videos')
+        ai_video_dir = ai_video_dir if os.path.isdir(ai_video_dir) else None
+
+        train_video_section(
+            video_dir               = real_videos_dir,
+            epochs                  = args.epochs,
+            batch_size              = VID_BATCH,
+            lr                      = VID_LR,
+            tile_size               = VID_TILE_SIZE,
+            fps_sample              = args.fps,
+            checkpoint_interval_min = CKPT_INTERVAL_MIN,
+            resume_path             = VIDEO_CKPT_PATH,
+            use_audio               = False,
+            ai_video_dir            = ai_video_dir,
+        )
         print("\nDone.")
     else:
         interactive_main()
