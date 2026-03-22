@@ -18,6 +18,8 @@ build/
 
 # Data directories (too large for version control)
 data/
+!data/real_urls.txt
+!data/ai_urls.txt
 genimage_data/
 
 # Model files (large binary files)
