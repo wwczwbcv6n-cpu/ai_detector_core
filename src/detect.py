@@ -106,6 +106,24 @@ V4_MODEL_PATH  = os.path.join(MODELS_DIR, 'ai_detector_prnu_fusion.pth')
 OLD_MODEL_PATH = os.path.join(MODELS_DIR, 'ai_detector_model_pytorch.pth')
 
 
+def _detect_backbone(state_dict: dict) -> str:
+    """Auto-detect backbone variant (b0 vs b3) from checkpoint state dict.
+
+    Uses the first conv weight shape in backbone.0.0.weight:
+      - B0: (32, 3, 3, 3)
+      - B3: (40, 3, 3, 3)
+    Falls back to 'b0' for new models.
+    """
+    key = 'backbone.0.0.weight'
+    if key in state_dict:
+        shape = state_dict[key].shape
+        if shape[0] == 40:
+            return 'b3'
+        elif shape[0] == 32:
+            return 'b0'
+    return 'b0'
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Grad-CAM
 # ═══════════════════════════════════════════════════════════════════════════
@@ -295,17 +313,19 @@ class Detector:
         # --- Step 0: try UnifiedFusionNet v1 ---
         if os.path.exists(UNIFIED_MODEL_PATH):
             try:
-                model = UnifiedFusionNet(prnu_in_features=64).to(self.device)
                 sd = torch.load(UNIFIED_MODEL_PATH, map_location=self.device,
                                 weights_only=True)
-                check_checkpoint_compat(model, sd.get('model_state_dict', sd))
-                model.load_state_dict(sd.get('model_state_dict', sd), strict=False)
+                sd_inner = sd.get('model_state_dict', sd)
+                backbone = _detect_backbone(sd_inner)
+                model = UnifiedFusionNet(prnu_in_features=64, backbone=backbone).to(self.device)
+                check_checkpoint_compat(model, sd_inner)
+                model.load_state_dict(sd_inner, strict=False)
                 model.eval()
                 self.model       = model
                 self.prnu_dim    = 64
-                self._model_type = 'UnifiedFusionNet v1'
+                self._model_type = f'UnifiedFusionNet v1 ({backbone.upper()})'
                 self.use_fusion  = True
-                print(f"  Loaded UnifiedFusionNet v1 from {UNIFIED_MODEL_PATH}")
+                print(f"  Loaded UnifiedFusionNet v1 ({backbone.upper()}) from {UNIFIED_MODEL_PATH}")
                 # Grad-CAM target layer
                 self.gradcam_layer = self.model.gradcam_target_layer
                 return
@@ -713,16 +733,18 @@ class Detector:
                 print(f"  Could not load state dict from {path}: {e}")
                 return None, None, None
 
-        # ── Detect architecture version ──────────────────────────────────
+        # ── Detect architecture version + backbone ─────────────────────────
+        backbone = _detect_backbone(state)
+
         if 'gan_diff_branch.spec_conv.0.weight' in state:
             # v6 architecture: 12 branches
             try:
-                model = DeepFusionNet(prnu_in_features=64).to(self.device)
+                model = DeepFusionNet(prnu_in_features=64, backbone=backbone).to(self.device)
                 missing, unexpected = model.load_state_dict(state, strict=False)
                 if unexpected:
                     print(f"  v6 load: {len(unexpected)} unexpected keys (ignored)")
                 model.eval()
-                return model, 64, 'DeepFusionNet v6'
+                return model, 64, f'DeepFusionNet v6 ({backbone.upper()})'
             except Exception as e:
                 print(f"  Failed to load v6 model from {path}: {e}")
                 return None, None, None
@@ -731,13 +753,13 @@ class Detector:
             # v5 architecture: 8 branches — load into v6 with strict=False
             # (new v6 branches will be randomly initialised)
             try:
-                model = DeepFusionNet(prnu_in_features=64).to(self.device)
+                model = DeepFusionNet(prnu_in_features=64, backbone=backbone).to(self.device)
                 missing, unexpected = model.load_state_dict(state, strict=False)
                 if missing:
                     print(f"  v5→v6 upgrade: {len(missing)} new-branch weights "
                           "initialised randomly")
                 model.eval()
-                return model, 64, 'DeepFusionNet v5→v6 (new branches randomly init)'
+                return model, 64, f'DeepFusionNet v5→v6 ({backbone.upper()}, new branches randomly init)'
             except Exception as e:
                 print(f"  Failed to upgrade v5 model from {path}: {e}")
                 return None, None, None
@@ -751,10 +773,10 @@ class Detector:
         else:
             # Unknown — try v6 anyway
             try:
-                model = DeepFusionNet(prnu_in_features=64).to(self.device)
+                model = DeepFusionNet(prnu_in_features=64, backbone=backbone).to(self.device)
                 model.load_state_dict(state, strict=False)
                 model.eval()
-                return model, 64, 'DeepFusionNet v6 (unknown checkpoint)'
+                return model, 64, f'DeepFusionNet v6 ({backbone.upper()}, unknown checkpoint)'
             except Exception as e:
                 print(f"  Failed to load unknown-version model from {path}: {e}")
                 return None, None, None

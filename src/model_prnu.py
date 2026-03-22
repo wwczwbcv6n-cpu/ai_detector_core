@@ -44,11 +44,36 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from torchvision.models import (
+    efficientnet_b0, EfficientNet_B0_Weights,
     efficientnet_b3, EfficientNet_B3_Weights,
     mobilenet_v3_small, MobileNet_V3_Small_Weights,
 )
 
 _log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+#  Backbone factory — configurable EfficientNet variant
+# ---------------------------------------------------------------------------
+
+_BACKBONE_REGISTRY = {
+    'b0': (efficientnet_b0, EfficientNet_B0_Weights.IMAGENET1K_V1, 1280),
+    'b3': (efficientnet_b3, EfficientNet_B3_Weights.IMAGENET1K_V1, 1536),
+}
+
+
+def _build_backbone(name: str = 'b0', freeze_ratio: float = 0.60):
+    """Build an EfficientNet backbone, freeze bottom layers, return (features, last_block, out_dim)."""
+    if name not in _BACKBONE_REGISTRY:
+        raise ValueError(f"Unknown backbone '{name}'. Choose from: {list(_BACKBONE_REGISTRY)}")
+    fn, weights, out_dim = _BACKBONE_REGISTRY[name]
+    net = fn(weights=weights)
+    children = list(net.features.children())
+    freeze_until = int(len(children) * freeze_ratio)
+    for i, block in enumerate(children):
+        if i < freeze_until:
+            for p in block.parameters():
+                p.requires_grad_(False)
+    return net.features, children[-1], out_dim
 
 
 def _safe_branch(branch: nn.Module, *args, out_dim: int,
@@ -998,21 +1023,15 @@ class DeepFusionNet(nn.Module):
     _FREEZE_RATIO = 0.60
 
     def __init__(self, dropout: float = 0.4, prnu_in_features: int = 64,
-                 gradient_checkpointing: bool = False):
+                 gradient_checkpointing: bool = False, backbone: str = 'b0'):
         super().__init__()
         self.use_ckpt = gradient_checkpointing
+        self._backbone_name = backbone
 
         # ── Vision backbone ──────────────────────────────────────────────
-        net = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
-        feature_children = list(net.features.children())
-        freeze_until     = int(len(feature_children) * self._FREEZE_RATIO)
-        for i, block in enumerate(feature_children):
-            if i < freeze_until:
-                for p in block.parameters():
-                    p.requires_grad = False
-        self.backbone    = net.features
-        self.pool        = nn.AdaptiveAvgPool2d((1, 1))
-        self._last_block = feature_children[-1]
+        self.backbone, self._last_block, cnn_dim = _build_backbone(backbone, self._FREEZE_RATIO)
+        self._cnn_dim = cnn_dim
+        self.pool     = nn.AdaptiveAvgPool2d((1, 1))
 
         # ── Branches (v5 — unchanged) ─────────────────────────────────────
         self.srm_branch          = SRMBranch(out_features=64)
@@ -1031,7 +1050,7 @@ class DeepFusionNet(nn.Module):
 
         # ── Cross-attention fusion ────────────────────────────────────────
         branch_dims = [
-            1536,   # backbone
+            cnn_dim, # backbone (1280 for B0, 1536 for B3)
             64,     # SRM
             128,    # Frequency
             64,     # ColorForensics
@@ -1039,10 +1058,10 @@ class DeepFusionNet(nn.Module):
             128,    # SpatialCNN
             128,    # Hallucination
             128,    # PRNUSpatial
-            128,    # GAN/Diffusion fingerprint  ← NEW
-            96,     # CMOS/CCD sensor noise      ← NEW
-            96,     # Color Channel Inconsistency← NEW
-            96,     # Optical Flow Irregularity  ← NEW
+            128,    # GAN/Diffusion fingerprint
+            96,     # CMOS/CCD sensor noise
+            96,     # Color Channel Inconsistency
+            96,     # Optical Flow Irregularity
         ]   # 12 branches → total tokens = 12
         self.branch_gate = BranchGate(branch_dims)   # v6.1: SE-style branch weighting
         self.fusion = CrossAttentionFusion(
@@ -1096,7 +1115,7 @@ class DeepFusionNet(nn.Module):
                 raise ValueError("NaN/Inf in backbone output")
         except Exception as exc:
             _log.warning("[DeepFusionNet] backbone failed (%s) — zeroing", exc)
-            cnn_out = _z(1536)
+            cnn_out = _z(self._cnn_dim)
 
         # ── Branches — each wrapped independently ────────────────────────
         srm_out          = _safe_branch(self.srm_branch,          img,       out_dim=64,   B=B, device=_d, dtype=_t)
@@ -1164,11 +1183,13 @@ class DeepFusionNet(nn.Module):
         total     = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen    = total - trainable
+        bb = self._backbone_name.upper()
         print(
-            "  DeepFusionNet v6.1  (B3 + SRM×15 + FFT×3 + YCbCr + PRNU-64 + SpatialCNN + "
+            f"  DeepFusionNet v6.1  ({bb} + SRM×15 + FFT×3 + YCbCr + PRNU-64 + SpatialCNN + "
             "MobileNetV3 + PRNUSpatialMap + GAN/Diff + CMOS/CCD + "
             "ColorIncon + OpticalFlow + BranchGate + CrossAttn-192×3 + INT8-ready)"
         )
+        print(f"  Backbone            : EfficientNet-{bb} ({self._cnn_dim}-dim)")
         print(f"  Total parameters    : {total:,}")
         print(f"  Trainable           : {trainable:,}  ({trainable/total*100:.1f}%)")
         print(f"  Frozen (backbone)   : {frozen:,}  ({frozen/total*100:.1f}%)")
@@ -1563,27 +1584,21 @@ class VideoTemporalFusionNet(nn.Module):
 
     VRAM estimate @ batch=4, 512×512, T=8 pairs, AMP FP16: ~2.8 GB
     """
-    _CNN_DIM    = 1536
     _FLOW_DIM   = 64
     _PRNU_DIM   = 64
     _PRNU_TEMP_DIM = 32
-    _MOTION_DIM = 128   # ← NEW
+    _MOTION_DIM = 128
     _AUDIO_DIM  = 64
     _FREEZE_RATIO = 0.60
 
-    def __init__(self, dropout: float = 0.4, use_audio: bool = False):
+    def __init__(self, dropout: float = 0.4, use_audio: bool = False,
+                 backbone: str = 'b0'):
         super().__init__()
         self.use_audio = use_audio
+        self._backbone_name = backbone
 
-        net = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
-        children = list(net.features.children())
-        freeze_until = int(len(children) * self._FREEZE_RATIO)
-        for i, b in enumerate(children):
-            if i < freeze_until:
-                for p in b.parameters(): p.requires_grad = False
-        self.backbone    = net.features
-        self.pool        = nn.AdaptiveAvgPool2d((1, 1))
-        self._last_block = children[-1]
+        self.backbone, self._last_block, self._CNN_DIM = _build_backbone(backbone, self._FREEZE_RATIO)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
         self.temporal_branch      = TemporalFlowBranch(in_channels=6, out_features=self._FLOW_DIM)
         self.prnu_branch          = PRNUDeepBranch(in_features=64, out_features=self._PRNU_DIM)
@@ -1686,9 +1701,11 @@ class VideoTemporalFusionNet(nn.Module):
     def param_summary(self):
         total     = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        bb = self._backbone_name.upper()
         print(f"  VideoTemporalFusionNet v5  "
-              f"(B3 + flow + PRNU + PRNU-Δ + MotionGRU + CrossAttention, "
+              f"({bb} + flow + PRNU + PRNU-Δ + MotionGRU + CrossAttention, "
               f"Audio: {self.use_audio})")
+        print(f"  Backbone: EfficientNet-{bb} ({self._CNN_DIM}-dim)")
         print(f"  Total: {total:,}  Trainable: {trainable:,}")
 
 
@@ -1738,7 +1755,7 @@ class UnifiedFusionNet(nn.Module):
     """
     Unified image + video AI-detector — v1.
 
-    Shares one EfficientNet-B3 backbone, one BranchGate, one CrossAttentionFusion.
+    Shares one EfficientNet backbone (B0 default, B3 optional), one BranchGate, one CrossAttentionFusion.
     Image branches are always computed; video branches are zeroed in image mode.
 
     Image mode  (default, mode="image"):
@@ -1764,26 +1781,22 @@ class UnifiedFusionNet(nn.Module):
     """
 
     _FREEZE_RATIO    = 0.60
-    _IMG_BRANCH_DIMS = [1536, 64, 128, 64, 96, 128, 128, 128, 128, 96, 96, 96, 96]
     _VID_BRANCH_DIMS = [64, 64, 32, 128]
-    _ALL_DIMS        = _IMG_BRANCH_DIMS + _VID_BRANCH_DIMS   # 17 branches, sum=3072
 
     def __init__(self, dropout: float = 0.4, prnu_in_features: int = 64,
-                 gradient_checkpointing: bool = False):
+                 gradient_checkpointing: bool = False, backbone: str = 'b0'):
         super().__init__()
         self.use_ckpt = gradient_checkpointing
+        self._backbone_name = backbone
 
-        # ── Shared backbone (EfficientNet-B3, bottom 60% frozen) ─────────
-        net = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
-        feature_children = list(net.features.children())
-        freeze_until = int(len(feature_children) * self._FREEZE_RATIO)
-        for i, block in enumerate(feature_children):
-            if i < freeze_until:
-                for p in block.parameters():
-                    p.requires_grad_(False)
-        self.backbone    = net.features
-        self.pool        = nn.AdaptiveAvgPool2d((1, 1))
-        self._last_block = feature_children[-1]
+        # ── Shared backbone (configurable, bottom 60% frozen) ────────────
+        self.backbone, self._last_block, cnn_dim = _build_backbone(backbone, self._FREEZE_RATIO)
+        self._cnn_dim = cnn_dim
+        self.pool     = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Compute branch dims with actual backbone output size
+        self._IMG_BRANCH_DIMS = [cnn_dim, 64, 128, 64, 96, 128, 128, 128, 128, 96, 96, 96, 96]
+        self._ALL_DIMS = self._IMG_BRANCH_DIMS + self._VID_BRANCH_DIMS
 
         # ── Image branches (identical attribute names to DeepFusionNet) ───
         self.srm_branch          = SRMBranch(out_features=64)
@@ -1864,7 +1877,7 @@ class UnifiedFusionNet(nn.Module):
                 raise ValueError("NaN/Inf in backbone output")
         except Exception as exc:
             _log.warning("[UnifiedFusionNet] backbone failed (%s) — zeroing", exc)
-            cnn_out = _z(1536)
+            cnn_out = _z(self._cnn_dim)
 
         # ── Image branches (each independently guarded via _safe_branch) ─
         srm_out         = _safe_branch(self.srm_branch,          img,        out_dim=64,  B=B, device=_d, dtype=_t)
@@ -1950,12 +1963,14 @@ class UnifiedFusionNet(nn.Module):
         total     = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen    = total - trainable
+        bb = self._backbone_name.upper()
         print(
-            "  UnifiedFusionNet v1  (B3 + SRM×15 + FFT×3 + YCbCr + PRNU-64 + SpatialCNN +\n"
+            f"  UnifiedFusionNet v1  ({bb} + SRM×15 + FFT×3 + YCbCr + PRNU-64 + SpatialCNN +\n"
             "    MobileNetV3 + PRNUSpatialMap + GAN/Diff + CMOS + ColorIncon + FlowIrreg +\n"
             "    Format + TemporalFlow + PRNUDeep + PRNUTemporal + MotionGRU +\n"
             "    BranchGate-17 + CrossAttn-192×5×17 + INT8-ready)"
         )
+        print(f"  Backbone            : EfficientNet-{bb} ({self._cnn_dim}-dim)")
         print(f"  Total parameters    : {total:,}")
         print(f"  Trainable           : {trainable:,}  ({trainable/total*100:.1f}%)")
         print(f"  Frozen (backbone)   : {frozen:,}  ({frozen/total*100:.1f}%)")
@@ -1974,7 +1989,8 @@ class UnifiedFusionNet(nn.Module):
     @classmethod
     def migrate_from_checkpoints(cls, image_ckpt_path: str,
                                   video_ckpt_path: str = None,
-                                  device: str = 'cpu') -> 'UnifiedFusionNet':
+                                  device: str = 'cpu',
+                                  backbone: str = 'b0') -> 'UnifiedFusionNet':
         """
         Build a UnifiedFusionNet pre-loaded from existing separate checkpoints.
 
@@ -1983,7 +1999,7 @@ class UnifiedFusionNet(nn.Module):
           prnu_branch.*  → prnu_deep_branch.*   (renamed in UnifiedFusionNet)
           all others     → unchanged             (temporal_branch, motion_branch, etc.)
         """
-        net = cls()
+        net = cls(backbone=backbone)
         if image_ckpt_path and os.path.exists(image_ckpt_path):
             try:
                 sd = torch.load(image_ckpt_path, map_location=device, weights_only=True)
