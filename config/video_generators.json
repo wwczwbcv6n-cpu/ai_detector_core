@@ -7,13 +7,13 @@
     "auth_header":       "Authorization",
     "auth_prefix":       "Bearer ",
     "model":             "ltx-2-3-pro",
-    "resolution":        "1280x720",
+    "resolution":        "1920x1080",
     "timeout_s":         300,
     "submit_body": {
       "prompt":     "{prompt}",
       "model":      "ltx-2-3-pro",
       "duration":   "{duration_s}",
-      "resolution": "1280x720"
+      "resolution": "1920x1080"
     }
   }
 }

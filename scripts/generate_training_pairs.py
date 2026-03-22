@@ -25,6 +25,21 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _ROOT       = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_ROOT / "src"))
 
+# ── Load .env if python-dotenv is available ───────────────────────────────────
+_env_file = _ROOT / ".env"
+if _env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+    except ImportError:
+        # Fallback: parse .env manually (KEY=VALUE lines)
+        with open(_env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

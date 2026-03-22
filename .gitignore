@@ -40,6 +40,10 @@ libtorch*/
 *.swp
 *.swo
 
+# Secrets
+.env
+.env.*
+
 # OS
 .DS_Store
 Thumbs.db

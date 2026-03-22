@@ -42,7 +42,7 @@ _DEFAULTS: dict[str, Any] = {
         "prompt":     "{prompt}",
         "model":      "ltx-2-3-pro",
         "duration":   "{duration_s}",
-        "resolution": "1280x720",
+        "resolution": "1920x1080",
     },
 }
 
