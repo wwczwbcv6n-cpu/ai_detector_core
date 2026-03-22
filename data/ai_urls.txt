@@ -1,6 +1,22 @@
 # AI-generated content (label=1)
-# Fully AI-generated video
-https://www.youtube.com/watch?v=yT6ZnvENm5I&t=346s
-https://www.youtube.com/watch?v=MPfYkRVAdGo&list=RDMPfYkRVAdGo&start_radio=1
-https://www.youtube.com/watch?v=MUztVYnj0-Y&list=RDMUztVYnj0-Y&start_radio=1
-https://www.youtube.com/watch?v=9PL7IzPfA5s&list=RD9PL7IzPfA5s&start_radio=1
+# Videos created by AI generation models (Sora, Runway, Kling, etc.)
+# AI video compilations / showcases
+https://www.youtube.com/watch?v=yT6ZnvENm5I
+https://www.youtube.com/watch?v=MPfYkRVAdGo
+https://www.youtube.com/watch?v=MUztVYnj0-Y
+https://www.youtube.com/watch?v=9PL7IzPfA5s
+# Sora / OpenAI demos
+https://www.youtube.com/watch?v=HK6y8DAPN_0
+https://www.youtube.com/watch?v=IRSNjQ1yVDY
+# Runway Gen-2/Gen-3 demos
+https://www.youtube.com/watch?v=PJe5yTz30Kc
+https://www.youtube.com/watch?v=6Ise1RF1AxA
+# Kling AI / other AI video generators
+https://www.youtube.com/watch?v=4H0mFKQe4RY
+https://www.youtube.com/watch?v=e1JyVMqUYLI
+# Stable Video Diffusion / Pika
+https://www.youtube.com/watch?v=jMM1TUfdDBM
+https://www.youtube.com/watch?v=2XlMJJmFN0w
+# AI art / Midjourney video showcases
+https://www.youtube.com/watch?v=6KRSn49kCwA
+https://www.youtube.com/watch?v=PwgelrlIDEw

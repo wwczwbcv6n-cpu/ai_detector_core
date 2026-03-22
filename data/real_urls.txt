@@ -1,6 +1,24 @@
 # Real camera footage (label=0)
-# 4K 60fps real video
+# Diverse real-world 4K/HD video from real cameras
+# Nature / landscape / wildlife
 https://www.youtube.com/watch?v=5OodDag81jI
 https://www.youtube.com/watch?v=7-wCUG9OOm4
 https://www.youtube.com/watch?v=LLSJrEgOOtw
 https://www.youtube.com/watch?v=62gjaleYDjI
+# City / street / architecture
+https://www.youtube.com/watch?v=mBiGHKS3yjc
+https://www.youtube.com/watch?v=qp0HIF3SfI4
+https://www.youtube.com/watch?v=7wyl4Yd8aJk
+# Drone / aerial
+https://www.youtube.com/watch?v=ChOhcHD8fBA
+https://www.youtube.com/watch?v=2K5Bh5cY4cE
+https://www.youtube.com/watch?v=zlfKdbWwruY
+# People / faces / indoor
+https://www.youtube.com/watch?v=n4wGVPGl6X0
+https://www.youtube.com/watch?v=SBjQ9tuuTJQ
+# Sports / action
+https://www.youtube.com/watch?v=vKQ2KeECefo
+https://www.youtube.com/watch?v=8p2nPjYswig
+# Travel / documentary
+https://www.youtube.com/watch?v=1La4QzGeaaQ
+https://www.youtube.com/watch?v=BOQTRo1JXIY

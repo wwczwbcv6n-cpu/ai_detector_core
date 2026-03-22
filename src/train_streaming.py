@@ -116,6 +116,7 @@ AI_SOURCE_DIRS = [
     os.path.join(DATA_DIR, 'multi_cache', 'kaggle', 'cifake', 'train', 'FAKE'),
     os.path.join(DATA_DIR, 'multi_cache', 'kaggle', 'fake-faces',
                  'real_vs_fake', 'real-vs-fake', 'train', 'fake'),
+    os.path.join(DATA_DIR, 'pipeline_frames', 'ai'),
 ]
 
 _IMG_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
@@ -567,7 +568,7 @@ def load_url_list(source: str, url_file=None) -> list:
         print(f"  Loading URLs from custom file: {url_file}")
         with open(url_file, encoding='utf-8') as f:
             urls = [l.strip() for l in f
-                    if l.strip() and not l.startswith('#')
+                    if l.strip() and not l.strip().startswith('#')
                     and 'REAL_VIDEO_ID' not in l and 'AI_VIDEO_ID' not in l]
         print(f"  → {len(urls):,} URLs loaded")
         if not urls:
@@ -1149,6 +1150,17 @@ def main():
     parser.add_argument('--cookies_from_browser', type=str, default=None,
                         help='Pass browser cookies to yt-dlp for authenticated downloads '
                              '(e.g. "chrome", "firefox", "chromium"). Required for YouTube.')
+    parser.add_argument('--pipeline', action='store_true',
+                        help='Use pipeline-generated video frames as training data')
+    parser.add_argument('--pipeline_generate', action='store_true',
+                        help='Run generate_training_pairs.py before extracting frames '
+                             '(requires ANTHROPIC_API_KEY + ITXIO_API_KEY)')
+    parser.add_argument('--pipeline_source', type=str, default=None,
+                        help='Source for pipeline generation (e.g. data/real_urls.txt)')
+    parser.add_argument('--pipeline_max_pairs', type=int, default=None,
+                        help='Max video pairs to generate')
+    parser.add_argument('--pipeline_max_frames', type=int, default=32,
+                        help='Frames per pipeline video (default: 32)')
     args = parser.parse_args()
 
     # Colab/Jupyter guard: forked workers cause CUDA context errors in notebooks
@@ -1222,9 +1234,56 @@ def main():
         external_source = True
         random.shuffle(urls)  # shuffle once upfront, never wrap
 
+    # ── Pipeline mode: generate + extract frames ─────────────────────────
+    pipeline_ai_paths = []
+    if args.pipeline:
+        print("\n[1c/5] Pipeline mode ...")
+
+        # Optionally run generation first
+        if args.pipeline_generate:
+            if not args.pipeline_source:
+                print("ERROR: --pipeline_generate requires --pipeline_source")
+                sys.exit(1)
+            print(f"  Running generate_training_pairs.py (source={args.pipeline_source}) ...")
+            from training_data_pipeline import VideoTrainingDataPipeline
+            pipeline = VideoTrainingDataPipeline(
+                real_source=args.pipeline_source,
+                output_dir=os.path.join(DATA_DIR, 'video_pairs'),
+                dry_run=False,
+            )
+            pipeline.run(max_pairs=args.pipeline_max_pairs, skip_existing=True)
+
+        # Extract frames from pipeline videos
+        from extract_pipeline_frames import extract_pipeline_frames
+        real_frames, ai_frames = extract_pipeline_frames(
+            max_frames_per_video=args.pipeline_max_frames,
+            force=False,
+        )
+
+        if real_frames:
+            urls = real_frames
+            external_source = True
+            one_pass_batches = max(1, -(-len(urls) // args.batch_real))
+            if args.total_batches != one_pass_batches:
+                print(f"  --pipeline mode: total_batches = {one_pass_batches} "
+                      f"(one pass over {len(urls)} frames, batch_real={args.batch_real})")
+                args.total_batches = one_pass_batches
+            random.shuffle(urls)
+            print(f"  Pipeline real frames: {len(real_frames)}")
+
+        if ai_frames:
+            pipeline_ai_paths = ai_frames
+            print(f"  Pipeline AI frames: {len(ai_frames)}")
+
+        if not real_frames and not ai_frames:
+            print("  WARNING: No pipeline frames found. Falling back to default sources.")
+
     # ── Load AI image pool ────────────────────────────────────────────────
     print("\n[2/5] Scanning local AI image pool ...")
     ai_paths = load_ai_image_paths()
+    if pipeline_ai_paths:
+        ai_paths.extend(pipeline_ai_paths)
+        print(f"  + {len(pipeline_ai_paths)} pipeline AI frames → total: {len(ai_paths)}")
 
     # Pre-download AI frames from --ai_url_file (YouTube/video/image URLs)
     if args.ai_url_file:
