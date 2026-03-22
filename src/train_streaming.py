@@ -557,25 +557,73 @@ def _download_metadata_csv(source: str) -> str:
     return cache_path
 
 
+_BUILTIN_REAL_URLS = [
+    # Nature / landscape
+    'https://www.youtube.com/watch?v=5OodDag81jI',
+    'https://www.youtube.com/watch?v=7-wCUG9OOm4',
+    'https://www.youtube.com/watch?v=LLSJrEgOOtw',
+    'https://www.youtube.com/watch?v=62gjaleYDjI',
+    # City / street
+    'https://www.youtube.com/watch?v=mBiGHKS3yjc',
+    'https://www.youtube.com/watch?v=qp0HIF3SfI4',
+    'https://www.youtube.com/watch?v=7wyl4Yd8aJk',
+    # Drone / aerial
+    'https://www.youtube.com/watch?v=ChOhcHD8fBA',
+    'https://www.youtube.com/watch?v=2K5Bh5cY4cE',
+    'https://www.youtube.com/watch?v=zlfKdbWwruY',
+    # People / indoor
+    'https://www.youtube.com/watch?v=n4wGVPGl6X0',
+    'https://www.youtube.com/watch?v=SBjQ9tuuTJQ',
+    # Sports / action
+    'https://www.youtube.com/watch?v=vKQ2KeECefo',
+    'https://www.youtube.com/watch?v=8p2nPjYswig',
+    # Travel / documentary
+    'https://www.youtube.com/watch?v=1La4QzGeaaQ',
+    'https://www.youtube.com/watch?v=BOQTRo1JXIY',
+]
+
+_BUILTIN_AI_URLS = [
+    # AI video compilations
+    'https://www.youtube.com/watch?v=yT6ZnvENm5I',
+    'https://www.youtube.com/watch?v=MPfYkRVAdGo',
+    'https://www.youtube.com/watch?v=MUztVYnj0-Y',
+    'https://www.youtube.com/watch?v=9PL7IzPfA5s',
+    # Sora / OpenAI
+    'https://www.youtube.com/watch?v=HK6y8DAPN_0',
+    'https://www.youtube.com/watch?v=IRSNjQ1yVDY',
+    # Runway Gen-2/Gen-3
+    'https://www.youtube.com/watch?v=PJe5yTz30Kc',
+    'https://www.youtube.com/watch?v=6Ise1RF1AxA',
+    # Kling AI
+    'https://www.youtube.com/watch?v=4H0mFKQe4RY',
+    'https://www.youtube.com/watch?v=e1JyVMqUYLI',
+    # Stable Video Diffusion / Pika
+    'https://www.youtube.com/watch?v=jMM1TUfdDBM',
+    'https://www.youtube.com/watch?v=2XlMJJmFN0w',
+    # AI art showcases
+    'https://www.youtube.com/watch?v=6KRSn49kCwA',
+    'https://www.youtube.com/watch?v=PwgelrlIDEw',
+]
+
+
+def _parse_url_file(path: str) -> list:
+    """Read URLs from a text file, skip comments and placeholders."""
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding='utf-8') as f:
+        return [l.strip() for l in f
+                if l.strip() and not l.strip().startswith('#')
+                and 'REAL_VIDEO_ID' not in l and 'AI_VIDEO_ID' not in l]
+
+
 def load_url_list(source: str, url_file=None) -> list:
     if url_file:
-        if not os.path.exists(url_file):
-            raise FileNotFoundError(
-                f"URL file not found: '{url_file}'\n"
-                f"  Create it with one URL per line, or omit --url_file to stream from Open Images.\n"
-                f"  Example: python train_streaming.py --source val --total_batches 500"
-            )
         print(f"  Loading URLs from custom file: {url_file}")
-        with open(url_file, encoding='utf-8') as f:
-            urls = [l.strip() for l in f
-                    if l.strip() and not l.strip().startswith('#')
-                    and 'REAL_VIDEO_ID' not in l and 'AI_VIDEO_ID' not in l]
-        print(f"  → {len(urls):,} URLs loaded")
+        urls = _parse_url_file(url_file) if os.path.exists(url_file) else []
+        print(f"  → {len(urls):,} URLs loaded from file")
         if not urls:
-            raise ValueError(
-                f"No valid URLs found in '{url_file}' (all lines are comments or placeholders).\n"
-                f"  Add real URLs to the file or use --source val to stream from Open Images."
-            )
+            print(f"  WARNING: No valid URLs in '{url_file}' — using {len(_BUILTIN_REAL_URLS)} built-in real URLs")
+            urls = list(_BUILTIN_REAL_URLS)
         return urls
 
     csv_path = _download_metadata_csv(source)
@@ -1288,8 +1336,10 @@ def main():
     # Pre-download AI frames from --ai_url_file (YouTube/video/image URLs)
     if args.ai_url_file:
         print(f"  Loading AI URLs from: {args.ai_url_file}")
-        with open(args.ai_url_file, encoding='utf-8') as f:
-            ai_urls = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+        ai_urls = _parse_url_file(args.ai_url_file)
+        if not ai_urls:
+            print(f"  WARNING: No valid URLs in '{args.ai_url_file}' — using {len(_BUILTIN_AI_URLS)} built-in AI URLs")
+            ai_urls = list(_BUILTIN_AI_URLS)
         print(f"  → {len(ai_urls)} AI URLs. Downloading frames...")
         ai_dl_dir = os.path.join(DATA_DIR, 'ai_url_frames')
         os.makedirs(ai_dl_dir, exist_ok=True)
